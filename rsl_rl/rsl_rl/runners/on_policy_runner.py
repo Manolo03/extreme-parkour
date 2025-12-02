@@ -251,7 +251,9 @@ class OnPolicyRunner:
                         scandots_latent = self.alg.actor_critic.actor.infer_scandots_latent(obs)
                     scandots_latent_buffer.append(scandots_latent)
                     obs_prop_depth = obs[:, :self.env.cfg.env.n_proprio].clone()
-                    obs_prop_depth[:, 6:8] = 0
+                    # Mask yaw using config-based indices
+                    start_idx, length = self.env.cfg.env.obs_indices.get("yaw")
+                    obs_prop_depth[:, start_idx:start_idx + length] = 0
                     depth_latent_and_yaw = self.alg.depth_encoder(infos["depth"].clone(), obs_prop_depth)  # clone is crucial to avoid in-place operation
                     
                     depth_latent = depth_latent_and_yaw[:, :-2]
@@ -259,15 +261,16 @@ class OnPolicyRunner:
                     
                     depth_latent_buffer.append(depth_latent)
                     yaw_buffer_student.append(yaw)
-                    yaw_buffer_teacher.append(obs[:, 6:8])
+                    yaw_buffer_teacher.append(obs[:, start_idx:start_idx + length])
                 
                 with torch.no_grad():
                     actions_teacher = self.alg.actor_critic.act_inference(obs, hist_encoding=True, scandots_latent=None)
                     actions_teacher_buffer.append(actions_teacher)
 
                 obs_student = obs.clone()
-                # obs_student[:, 6:8] = yaw.detach()
-                obs_student[infos["delta_yaw_ok"], 6:8] = yaw.detach()[infos["delta_yaw_ok"]]
+                # Set yaw using config-based indices
+                start_idx, length = self.env.cfg.env.obs_indices.get("yaw")
+                obs_student[infos["delta_yaw_ok"], start_idx:start_idx + length] = yaw.detach()[infos["delta_yaw_ok"]]
                 delta_yaw_ok_buffer.append(torch.nonzero(infos["delta_yaw_ok"]).size(0) / infos["delta_yaw_ok"].numel())
                 actions_student = self.alg.depth_actor(obs_student, hist_encoding=True, scandots_latent=depth_latent)
                 actions_student_buffer.append(actions_student)

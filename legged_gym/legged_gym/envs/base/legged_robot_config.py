@@ -85,6 +85,28 @@ class LeggedRobotCfg(BaseConfig):
         next_goal_threshold = 0.2
         reach_goal_delay = 0.1
         num_future_goal_obs = 2
+        
+        # Observation index mapping for cleaner code (avoids hardcoded indices like [:, 5:7])
+        # Maps observation component names to (start_idx, length) in the proprioceptive observation buffer
+        # Indices are computed based on the order in compute_observations():
+        # 0-2: base_ang_vel, 3-4: imu, 5: padding_yaw, 6: delta_yaw, 7: delta_next_yaw,
+        # 8-9: padding_commands, 10: command, 11-12: env_class_flags,
+        # 13-24: dof_pos, 25-36: dof_vel, 37-48: action_history, 49-52: contact_filt
+        obs_indices = {
+            "base_ang_vel": (0, 3),
+            "imu": (3, 2),
+            "padding_yaw": (5, 1),
+            "delta_yaw": (6, 1),
+            "delta_next_yaw": (7, 1),
+            "yaw": (6, 2),  # Combined delta_yaw + delta_next_yaw for convenience
+            "padding_commands": (8, 2),
+            "command": (10, 1),
+            "env_class_flags": (11, 2),
+            "dof_pos": (13, 12),
+            "dof_vel": (25, 12),
+            "action_history": (37, 12),
+            "contact_filt": (49, 4),
+        }
 
     class depth:
         use_camera = False
@@ -323,7 +345,7 @@ class LeggedRobotCfg(BaseConfig):
 
     # viewer camera:
     class viewer:
-        ref_env = 0
+        ref_env = 5
         pos = [10, 0, 6]  # [m]
         lookat = [11., 5, 3.]  # [m]
 

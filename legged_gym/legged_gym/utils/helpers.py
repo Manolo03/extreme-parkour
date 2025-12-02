@@ -144,33 +144,6 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
         # num envs
         if args.num_envs is not None:
             env_cfg.env.num_envs = args.num_envs
-        terrain_cfg = getattr(env_cfg, "terrain", None)
-        if (
-            terrain_cfg is not None
-            and terrain_cfg.mesh_type in ["heightfield", "trimesh"]
-            and not env_cfg.depth.use_camera
-            and args.rows is None
-            and args.cols is None
-        ):
-            num_tiles = terrain_cfg.num_rows * terrain_cfg.num_cols
-            num_envs = getattr(env_cfg.env, "num_envs", num_tiles)
-            if num_envs < num_tiles:
-                target_tiles = max(num_envs, getattr(terrain_cfg, "min_num_tiles", 16))
-                aspect = terrain_cfg.num_rows / max(terrain_cfg.num_cols, 1)
-                new_rows = max(1, int(np.sqrt(target_tiles * aspect)))
-                new_cols = max(1, int(np.ceil(target_tiles / new_rows)))
-                if new_rows * new_cols < target_tiles:
-                    new_cols = target_tiles // new_rows + (target_tiles % new_rows > 0)
-                terrain_cfg.num_rows = new_rows
-                terrain_cfg.num_cols = new_cols
-                if hasattr(terrain_cfg, "max_init_terrain_level"):
-                    terrain_cfg.max_init_terrain_level = min(
-                        terrain_cfg.max_init_terrain_level, max(new_rows - 1, 0)
-                    )
-                print(
-                    f"Auto-adjust terrain grid to {new_rows}x{new_cols} "
-                    f"for {num_envs} environments to limit mesh size."
-                )
         if args.seed is not None:
             env_cfg.seed = args.seed
         if args.task_both:

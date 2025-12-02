@@ -149,12 +149,15 @@ def play(args):
         if env.cfg.depth.use_camera:
             if infos["depth"] is not None:
                 obs_student = obs[:, :env.cfg.env.n_proprio]
-                obs_student[:, 6:8] = 0
+                # Mask yaw using config-based indices
+                start_idx, length = env.cfg.env.obs_indices.get("yaw")
+                obs_student[:, start_idx:start_idx + length] = 0
                 with torch.no_grad():
                     depth_latent_and_yaw = depth_encoder(infos["depth"], obs_student)
                 depth_latent = depth_latent_and_yaw[:, :-2]
                 yaw = depth_latent_and_yaw[:, -2:]
-            obs[:, 6:8] = 1.5*yaw
+            start_idx, length = env.cfg.env.obs_indices.get("yaw")
+            obs[:, start_idx:start_idx + length] = 1.5*yaw
                 
         else:
             depth_latent = None

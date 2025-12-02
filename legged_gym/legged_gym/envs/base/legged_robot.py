@@ -286,6 +286,39 @@ class LeggedRobot(BaseTask):
 
     def reindex(self, vec):
         return vec[:, [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]]
+    
+    def get_obs_slice(self, obs, name):
+        """
+        Get observation slice by name using config-based index mapping.
+        
+        Args:
+            obs: Observation tensor of shape (num_envs, num_obs)
+            name: Name of observation component (e.g., "yaw", "delta_yaw", "command")
+            
+        Returns:
+            Slice of observation tensor corresponding to the named component
+        """
+        if not hasattr(self.cfg.env, 'obs_indices') or name not in self.cfg.env.obs_indices:
+            raise ValueError(f"Observation component '{name}' not found in cfg.env.obs_indices. "
+                           f"Available: {list(getattr(self.cfg.env, 'obs_indices', {}).keys())}")
+        start_idx, length = self.cfg.env.obs_indices[name]
+        return obs[:, start_idx:start_idx + length]
+    
+    def set_obs_slice(self, obs, name, value):
+        """
+        Set observation slice by name using config-based index mapping.
+        
+        Args:
+            obs: Observation tensor to modify (will be modified in-place)
+            name: Name of observation component
+            value: Tensor of shape (num_envs, length) to set
+        """
+        if not hasattr(self.cfg.env, 'obs_indices') or name not in self.cfg.env.obs_indices:
+            raise ValueError(f"Observation component '{name}' not found in cfg.env.obs_indices")
+        start_idx, length = self.cfg.env.obs_indices[name]
+        if value.shape[1] != length:
+            raise ValueError(f"Value shape {value.shape[1]} doesn't match expected length {length} for '{name}'")
+        obs[:, start_idx:start_idx + length] = value
 
     def check_termination(self):
         """ Check if environments need to be reset
@@ -417,7 +450,9 @@ class LeggedRobot(BaseTask):
             self.obs_buf = torch.cat([obs_buf, heights, priv_explicit, priv_latent, self.obs_history_buf.view(self.num_envs, -1)], dim=-1)
         else:
             self.obs_buf = torch.cat([obs_buf, priv_explicit, priv_latent, self.obs_history_buf.view(self.num_envs, -1)], dim=-1)
-        obs_buf[:, 6:8] = 0  # mask yaw in proprioceptive history
+        # Mask yaw in proprioceptive history using config-based indices
+        start_idx, length = self.cfg.env.obs_indices.get("yaw")
+        obs_buf[:, start_idx:start_idx + length] = 0
         self.obs_history_buf = torch.where(
             (self.episode_length_buf <= 1)[:, None, None], 
             torch.stack([obs_buf] * self.cfg.env.history_len, dim=1),
