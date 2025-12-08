@@ -145,6 +145,12 @@ class PPO:
         # Compute the actions and values, use proprio to compute estimated priv_states then actions, but store true priv_states
         if self.train_with_estimated_states:
             obs_est = obs.clone()
+            # Debug: check what we're slicing
+            if not hasattr(self, '_debug_printed'):
+                print(f"PPO.act: obs.shape = {obs.shape}, self.num_prop = {self.num_prop}")
+                print(f"PPO.act: obs_est[:, :self.num_prop].shape = {obs_est[:, :self.num_prop].shape}")
+                print(f"PPO.act: obs_est[:, :34].shape = {obs_est[:, :34].shape}")
+                self._debug_printed = True
             priv_states_estimated = self.estimator(obs_est[:, :self.num_prop])
             obs_est[:, self.num_prop+self.num_scan:self.num_prop+self.num_scan+self.priv_states_dim] = priv_states_estimated
             self.transition.actions = self.actor_critic.act(obs_est, hist_encoding).detach()
