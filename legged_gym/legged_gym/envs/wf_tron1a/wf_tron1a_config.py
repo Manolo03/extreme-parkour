@@ -43,7 +43,6 @@ class WfTron1aCfg(LeggedRobotCfg):
         num_observations = n_proprio + n_scan + n_priv +  n_priv_latent + history_len*n_proprio  #34 + 132 + 3 + 21  + 340  = 530
         
         # Observation index mapping for tron1a (indices may differ from base config due to removed padding)
-        # TODO: Update these indices to match your actual compute_observations() structure
         # Current structure (with removed command padding): 
         # 0-2: base_ang_vel, 3-4: imu, 5: padding_yaw, 6: delta_yaw, 7: delta_next_yaw,
         # 8: command, 9-10: env_class_flags, 11-22: dof_pos (reindexed), 23-34: dof_vel, 
@@ -100,6 +99,161 @@ class WfTron1aCfg(LeggedRobotCfg):
         action_scale = 0.25
         decimation = 4
 
+    class depth(LeggedRobotCfg.depth):
+        """
+        Depth camera configuration for RealSense D435.
+        
+        Coordinate System:
+        - Both URDF and Isaac Gym use: x forward, y left, z UP (standard ROS convention)
+        - The position is relative to the root body (base_Link) frame
+        - Negative z means below the base origin, positive z means above
+        """
+        use_camera = False  # Set to True to enable depth camera
+        
+        # Camera position relative to root body (base_Link)
+        # From URDF d435_joint: xyz="0.13223 0.0222 -0.26826"
+        # z = -0.26826 means camera is 0.26826m below base origin (camera looks down)
+        position = [0.13223, 0.0222, -0.26826]  # [x forward, y left, z UP] in meters
+        
+        # Camera pitch angle (rotation around y-axis)
+        # From URDF: rpy="0 1.063778179 0" (pitch = 1.063778179 rad ≈ 60.9°)
+        # Positive pitch = camera looks down
+        # Range allows domain randomization (±5° variation)
+        angle = [55.9, 65.9]  # degrees, positive pitch = down
+        
+        # Camera update frequency
+        # update_interval = 5 means update every 5 simulation steps
+        # Lower = more frequent updates (more compute), Higher = less frequent (less compute)
+        update_interval = 5  # Update every 5 steps (5 works without retraining, 8 worse)
+        
+        # Image resolution
+        # RealSense D435 depth: 640×480 native, but we use smaller for efficiency
+        original = (106, 60)  # Original depth image resolution (width, height) in pixels
+        resized = (87, 58)   # Resized resolution for neural network input (width, height)
+        
+        # Field of view
+        # RealSense D435 depth camera: 85.2° × 58° FOV (H × V)
+        horizontal_fov = 85.2  # Horizontal FOV in degrees (matches D435 depth FOV)
+        #vertical fox computed from horizontal fov and aspect ratio
+
+
+
+        # Depth buffer (temporal history)
+        buffer_len = 2       # Number of consecutive frames stored (for temporal features)
+        
+        # Depth clipping planes
+        near_clip = 0        # Near clipping plane in meters (closer objects are clipped)
+        far_clip = 2         # Far clipping plane in meters (farther objects are clipped)
+        
+        # Noise and processing
+        dis_noise = 0.0      # Distance noise standard deviation (for domain randomization)
+        scale = 1           # Depth scaling factor (typically 1.0)
+        invert = True       # Whether to invert depth values (True = closer = brighter)
+        
+        # Terrain generation for camera (if using camera-specific terrain)
+        camera_num_envs = 192      # Number of environments with cameras enabled
+        camera_terrain_num_rows = 10  # Terrain rows for camera environments
+        camera_terrain_num_cols = 20  # Terrain cols for camera environments
+    
+    class terrain:
+        mesh_type = 'trimesh' # "heightfield" # none, plane, heightfield or trimesh
+        hf2mesh_method = "grid"  # grid or fast
+        max_error = 0.1 # for fast
+        max_error_camera = 2
+
+        y_range = [-0.4, 0.4]
+        
+        edge_width_thresh = 0.05
+        horizontal_scale = 0.05 # [m] influence computation time by a lot
+        horizontal_scale_camera = 0.1
+        vertical_scale = 0.005 # [m]
+        border_size = 5 # [m]
+        height = [0.02, 0.06]
+        simplify_grid = False
+        gap_size = [0.02, 0.1]
+        stepping_stone_distance = [0.02, 0.08]
+        downsampled_scale = 0.075
+        curriculum = True
+
+        all_vertical = False
+        no_flat = True
+        
+        static_friction = 1.0
+        dynamic_friction = 1.0
+        restitution = 0.
+        measure_heights = True
+        measured_points_x = [-0.45, -0.3, -0.15, 0, 0.15, 0.3, 0.45, 0.6, 0.75, 0.9, 1.05, 1.2] # 1mx1.6m rectangle (without center line)
+        measured_points_y = [-0.75, -0.6, -0.45, -0.3, -0.15, 0., 0.15, 0.3, 0.45, 0.6, 0.75]
+        measure_horizontal_noise = 0.0
+
+        selected = False # select a unique terrain type and pass all arguments
+        terrain_kwargs = None # Dict of arguments for selected terrain
+        max_init_terrain_level = 5 # starting curriculum state
+        terrain_length = 18.
+        terrain_width = 4
+        num_rows= 10 # number of terrain rows (levels)  # spreaded is benifitiall !
+        num_cols = 40 # number of terrain cols (types)
+        
+        terrain_dict = {"smooth slope": 0., 
+                        "rough slope up": 0.0,
+                        "rough slope down": 0.0,
+                        "rough stairs up": 0., 
+                        "rough stairs down": 0., 
+                        "discrete": 0., 
+                        "stepping stones": 0.0,
+                        "gaps": 0., 
+                        "smooth flat": 0,
+                        "pit": 0.0,
+                        "wall": 0.0,
+                        "platform": 0.,
+                        "large stairs up": 0.,
+                        "large stairs down": 0.,
+                        "parkour": 0.2,
+                        "parkour_hurdle": 0.2,
+                        "parkour_flat": 0.2,
+                        "parkour_step": 0.2,
+                        "parkour_gap": 0.2,
+                        "demo": 0.0,}
+        terrain_proportions = list(terrain_dict.values())
+        
+        # trimesh only:
+        slope_treshold = 1.5# slopes above this threshold will be corrected to vertical surfaces
+        origin_zero_z = True
+
+        num_goals = 8
+        
+    class commands:
+        curriculum = False
+        max_curriculum = 1.
+        num_commands = 4 # default: lin_vel_x, lin_vel_y, ang_vel_yaw, heading (in heading mode ang_vel_yaw is recomputed from heading error)
+        resampling_time = 6. # time before command are changed[s]
+        heading_command = True # if true: compute ang vel command from heading error
+        
+        lin_vel_clip = 0.2
+        ang_vel_clip = 0.4
+        # Easy ranges
+        class ranges:
+            lin_vel_x = [0., 1.5] # min max [m/s]
+            lin_vel_y = [0.0, 0.0]   # min max [m/s]
+            ang_vel_yaw = [0, 0]    # min max [rad/s]
+            heading = [0, 0]
+
+        # Easy ranges
+        class max_ranges:
+            lin_vel_x = [0.3, 0.8] # min max [m/s]
+            lin_vel_y = [-0.3, 0.3]#[0.15, 0.6]   # min max [m/s]
+            ang_vel_yaw = [-0, 0]    # min max [rad/s]
+            heading = [-1.6, 1.6]
+
+        class crclm_incremnt:
+            lin_vel_x = 0.1 # min max [m/s]
+            lin_vel_y = 0.1  # min max [m/s]
+            ang_vel_yaw = 0.1    # min max [rad/s]
+            heading = 0.5
+
+        waypoint_delta = 0.7
+
+
     class asset(LeggedRobotCfg.asset):
         file = "{LEGGED_GYM_ROOT_DIR}/resources/robots/wf_tron1a/urdf/robot.urdf"
         foot_name = "wheel"
@@ -120,7 +274,7 @@ class WfTron1aCfg(LeggedRobotCfg):
             tracking_yaw = 0.5
             # regularization rewards
             lin_vel_z = -1.0
-            ang_vel_xy = -0.05
+            #ang_vel_xy = -0.05
             orientation = -1.
             dof_acc = -2.5e-7
             collision = -10.
@@ -128,7 +282,7 @@ class WfTron1aCfg(LeggedRobotCfg):
             delta_torques = -1.0e-7
             torques = -0.00001
             #hip_pos = -0.5
-            dof_error = -0.04
+            #dof_error = -0.04
             feet_stumble = -1
             feet_edge = -1
             
