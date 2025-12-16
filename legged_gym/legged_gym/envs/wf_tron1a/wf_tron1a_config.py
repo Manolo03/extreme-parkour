@@ -35,28 +35,35 @@ class WfTron1aCfg(LeggedRobotCfg):
     class env(LeggedRobotCfg.env):
         num_actions = 8
          
-        n_proprio = 3 + 2 + 2 + 3 + (6+8+8) + 2 # 3 base ang vel + 2 imu (roll, pitch) + 2 yaw deltas (current and next) + 3 command and terrain flags + 6 joint pos + 8 joint vel (6 leg + 2 wheel) + 8 action history + 2 contact filt (2 wheels) = 34
+        # 3 base ang vel + 2 imu (roll, pitch) +
+        # 2 commands related (1 lin_vel_x command + 1 yaw error computed from heading target command) +
+        # 6 joint pos (legs only) + 8 joint vel (6 leg + 2 wheel) +
+        # 8 action history + 2 contact filt (2 wheels) = 29
+        n_proprio = 3 + 2 + 2 + (6+8+8)
         n_scan = 132
         n_priv = 3  # 3 base lin vel
         n_priv_latent = 4 + 1 + 8 + 8 
         history_len = 10
-        num_observations = n_proprio + n_scan + n_priv +  n_priv_latent + history_len*n_proprio  #34 + 132 + 3 + 21  + 340  = 530
+        num_observations = n_proprio + n_scan + n_priv +  n_priv_latent + history_len*n_proprio  #29 + 132 + 3 + 21  + 290  = 475
         
         # Observation index mapping for tron1a (indices may differ from base config due to removed padding)
-        # Current structure (with removed command padding): 
-        # 0-2: base_ang_vel, 3-4: imu, 5: padding_yaw, 6: delta_yaw, 7: delta_next_yaw,
-        # 8: command, 9-10: env_class_flags, 11-22: dof_pos (reindexed), 23-34: dof_vel, 
-        # 35-46: action_history, 47-48: contact_filt
+        # Current proprio structure:
+        # 0-2: base_ang_vel
+        # 3-4: imu (roll, pitch)
+        # 5:   commands (lin_vel_x)
+        # 6:   yaw error (delta_yaw)
+        # 7-12:  dof_pos (6 leg DOFs)
+        # 13-20: dof_vel (all 8 DOFs)
+        # 21-28: action_history
+        # 29-30: contact_filt
         obs_indices = {
             "base_ang_vel": (0, 3),
             "imu": (3, 2),
-            "yaw": (5, 2),
-            "command": (7, 1),
-            "env_class_flags": (8, 2),
-            "dof_pos": (10, 6),  
-            "dof_vel": (16, 8), 
-            "action_history": (24, 8),  
-            "contact_filt": (32, 2),  
+            "commands": (5, 1),
+            "yaw_error": (6, 1),
+            "dof_pos": (7, 6),  
+            "dof_vel": (13, 8), 
+            "action_history": (21, 8),  
         }
         
         
@@ -227,7 +234,7 @@ class WfTron1aCfg(LeggedRobotCfg):
         max_curriculum = 1.
         num_commands = 4 # default: lin_vel_x, lin_vel_y, ang_vel_yaw, heading (in heading mode ang_vel_yaw is recomputed from heading error)
         resampling_time = 6. # time before command are changed[s]
-        heading_command = True # if true: compute ang vel command from heading error
+        heading_command = False # Disabled: we handle yaw error ourselves via heading_target (fixed per env)
         
         lin_vel_clip = 0.2
         ang_vel_clip = 0.4
@@ -235,20 +242,20 @@ class WfTron1aCfg(LeggedRobotCfg):
         class ranges:
             lin_vel_x = [0., 1.5] # min max [m/s]
             lin_vel_y = [0.0, 0.0]   # min max [m/s]
-            ang_vel_yaw = [0, 0]    # min max [rad/s]
+            target_heading = [0, 0]    # min max [rad/s]
             heading = [0, 0]
 
         # Easy ranges
         class max_ranges:
             lin_vel_x = [0.3, 0.8] # min max [m/s]
             lin_vel_y = [-0.3, 0.3]#[0.15, 0.6]   # min max [m/s]
-            ang_vel_yaw = [-0, 0]    # min max [rad/s]
+            target_heading = [-0, 0]    # min max [rad/s]
             heading = [-1.6, 1.6]
 
         class crclm_incremnt:
             lin_vel_x = 0.1 # min max [m/s]
             lin_vel_y = 0.1  # min max [m/s]
-            ang_vel_yaw = 0.1    # min max [rad/s]
+            target_heading = 0.1    # min max [rad/s]
             heading = 0.5
 
         waypoint_delta = 0.7

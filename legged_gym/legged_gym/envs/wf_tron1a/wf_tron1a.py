@@ -32,6 +32,7 @@ from legged_gym.envs import LeggedRobot
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from .wf_tron1a_config import WfTron1aCfg
 from legged_gym.envs.base.legged_robot import euler_from_quaternion
+from legged_gym.utils.math import wrap_to_pi
 import torch, torchvision
 import numpy as np
 import os
@@ -243,6 +244,19 @@ class WfTron1a(LeggedRobot):
         self.commands = torch.zeros(self.num_envs, self.cfg.commands.num_commands, dtype=torch.float, device=self.device, requires_grad=False) # x vel, y vel, yaw vel, heading
         self._resample_commands(torch.arange(self.num_envs, device=self.device, requires_grad=False))
         self.commands_scale = torch.tensor([self.obs_scales.lin_vel, self.obs_scales.lin_vel, self.obs_scales.ang_vel], device=self.device, requires_grad=False,) # TODO change this
+
+        # Sample a fixed heading target per environment (in radians), which stays
+        # constant across resets and command resampling. Use the same range as the command heading.
+        if self.cfg.commands.curriculum:
+            heading_range = (self.cfg.commands.ranges.heading[0], self.cfg.commands.ranges.heading[1])
+        else:
+            heading_range = (self.cfg.commands.max_ranges.heading[0], self.cfg.commands.max_ranges.heading[1])
+        self.heading_target = torch_rand_float(
+            heading_range[0], heading_range[1], (self.num_envs, 1), device=self.device
+        ).squeeze(1)
+        # Store initial heading_target so it can be restored on command resampling
+        self.heading_target_initial = self.heading_target.clone()
+
         self.feet_air_time = torch.zeros(self.num_envs, self.feet_indices.shape[0], dtype=torch.float, device=self.device, requires_grad=False)
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
@@ -460,8 +474,10 @@ class WfTron1a(LeggedRobot):
         """
         imu_obs = torch.stack((self.roll, self.pitch), dim=1)
         if self.global_counter % 5 == 0:
-            self.delta_yaw = self.target_yaw - self.yaw
-            self.delta_next_yaw = self.next_target_yaw - self.yaw
+            # Yaw error comes from a per-env fixed heading target, sampled once
+            # from the command heading range, and kept constant across resets.
+            desired_heading = self.heading_target  # (num_envs,)
+            self.delta_yaw = wrap_to_pi(desired_heading - self.yaw)
 
         # Filter DOF positions to exclude wheels (6 leg DOFs only)
         # Keep all DOF velocities (all 8 DOFs including wheels)
@@ -470,17 +486,13 @@ class WfTron1a(LeggedRobot):
         default_dof_pos = self.default_dof_pos_all[:, non_wheel_mask]
         
         obs_buf = torch.cat((#skill_vector, 
-                            self.base_ang_vel  * self.obs_scales.ang_vel,   #[1,3]
-                            imu_obs,    #[1,2]
-                            self.delta_yaw[:, None],
-                            self.delta_next_yaw[:, None],
-                            self.commands[:, 0:1],  #[1,1]
-                            (self.env_class != 17).float()[:, None], 
-                            (self.env_class == 17).float()[:, None],
-                            ((dof_pos - default_dof_pos) * self.obs_scales.dof_pos),
-                            (self.dof_vel * self.obs_scales.dof_vel),
-                            (self.action_history_buf[:, -1]),
-                            (self.contact_filt.float()-0.5),
+                            self.base_ang_vel  * self.obs_scales.ang_vel,   #[3]
+                            imu_obs,    #[2]
+                            self.commands[:, 0:1],  #[1] lin_vel_x command
+                            self.delta_yaw[:, None],  #[1] yaw error (replaces heading command)
+                            ((dof_pos - default_dof_pos) * self.obs_scales.dof_pos),  #[6]
+                            (self.dof_vel * self.obs_scales.dof_vel),  #[8]
+                            (self.action_history_buf[:, -1]),  #[8]
                             ),dim=-1)
         
         # Debug: verify observation size
@@ -526,17 +538,34 @@ class WfTron1a(LeggedRobot):
             ], dim=1)
         )
     
+    def _resample_commands(self, env_ids):
+        """Override to restore the original heading_target instead of resampling it.
+        
+        The heading_target is fixed per environment (sampled once at initialization)
+        and should remain constant across command resampling. Later, when using
+        dynamic commands, heading_target will come from commands[:, 3] instead.
+        """
+        # Call parent method to resample velocity commands
+        super()._resample_commands(env_ids)
+        # Restore the original heading_target for these environments
+        self.heading_target[env_ids] = self.heading_target_initial[env_ids]
+    
     ################## parkour rewards ##################
 
     def _reward_tracking_goal_vel(self):
-        norm = torch.norm(self.target_pos_rel, dim=-1, keepdim=True)
-        target_vec_norm = self.target_pos_rel / (norm + 1e-5)
-        cur_vel = self.root_states[:, 7:9]
-        rew = torch.minimum(torch.sum(target_vec_norm * cur_vel, dim=-1), self.commands[:, 0]) / (self.commands[:, 0] + 1e-5)
+        # Reward velocity component in the direction of heading_target (not terrain goal direction)
+        # heading_target is the desired heading angle, convert to unit direction vector
+        heading_dir = torch.stack([torch.cos(self.heading_target), torch.sin(self.heading_target)], dim=1)  # (num_envs, 2)
+        cur_vel_xy = self.root_states[:, 7:9]  # world frame linear velocity (x, y)
+        # Project velocity onto heading direction: dot(vel, heading_dir)
+        vel_component = torch.sum(heading_dir * cur_vel_xy, dim=-1)  # (num_envs,)
+        # Normalize by command velocity and cap at 1.0 (same as original)
+        rew = torch.minimum(vel_component, self.commands[:, 0]) / (self.commands[:, 0] + 1e-5)
         return rew
 
     def _reward_tracking_yaw(self):
-        rew = torch.exp(-torch.abs(self.target_yaw - self.yaw))
+        # Track the per-env fixed heading target instead of terrain-goal yaw.
+        rew = torch.exp(-torch.abs(wrap_to_pi(self.heading_target - self.yaw)))
         return rew
     
     def _reward_lin_vel_z(self):
