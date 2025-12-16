@@ -29,7 +29,7 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobotCfgPPO
-
+import numpy as np
 
 class WfTron1aCfg(LeggedRobotCfg):
     class env(LeggedRobotCfg.env):
@@ -180,7 +180,8 @@ class WfTron1aCfg(LeggedRobotCfg):
         gap_size = [0.02, 0.1]
         stepping_stone_distance = [0.02, 0.08]
         downsampled_scale = 0.075
-        curriculum = True
+        # Use a fixed 10x40 grid of selected sloped-wall terrains (16 robots per tile with 6400 envs)
+        curriculum = False
 
         all_vertical = False
         no_flat = True
@@ -193,13 +194,24 @@ class WfTron1aCfg(LeggedRobotCfg):
         measured_points_y = [-0.75, -0.6, -0.45, -0.3, -0.15, 0., 0.15, 0.3, 0.45, 0.6, 0.75]
         measure_horizontal_noise = 0.0
 
-        selected = False # select a unique terrain type and pass all arguments
-        terrain_kwargs = None # Dict of arguments for selected terrain
-        max_init_terrain_level = 5 # starting curriculum state
-        terrain_length = 18.
-        terrain_width = 4
-        num_rows= 10 # number of terrain rows (levels)  # spreaded is benifitiall !
-        num_cols = 40 # number of terrain cols (types)
+        # Selected sloped-wall terrain on a 10x40 grid (6400 envs / 400 tiles = 16 robots per tile)
+        selected = True
+        terrain_kwargs = {
+            "type": "sloped_wall_terrain",
+            "terrain_kwargs": {
+                "min_height": 0.3,
+                "max_height": 1.0,
+                "slope_len_range": (1.0, 2.0),
+                "platform_len": 0.5,
+            }
+        }
+        max_init_terrain_level = 0  # Not used when curriculum=False
+        # terrain_length matches sloped_wall_terrain feature size:
+        # start platform (1.5m) + gap (1.0m) + feature (2×slope + 0.5m platform, ~6m worst case) + buffer
+        terrain_length = 10.0  # meters (forward direction, x-axis)
+        terrain_width = 30.0   # meters (lateral direction, y-axis) - matches visualize_terrain.py
+        num_rows = 10  # number of terrain rows (levels)
+        num_cols = 40  # number of terrain cols (types)
         
         terrain_dict = {"smooth slope": 0., 
                         "rough slope up": 0.0,
@@ -238,7 +250,7 @@ class WfTron1aCfg(LeggedRobotCfg):
         
         lin_vel_clip = 0.2
         ang_vel_clip = 0.4
-        # Easy ranges
+        # curriculum ranges
         class ranges:
             lin_vel_x = [0., 1.5] # min max [m/s]
             lin_vel_y = [0.0, 0.0]   # min max [m/s]
@@ -250,7 +262,7 @@ class WfTron1aCfg(LeggedRobotCfg):
             lin_vel_x = [0.3, 0.8] # min max [m/s]
             lin_vel_y = [-0.3, 0.3]#[0.15, 0.6]   # min max [m/s]
             target_heading = [-0, 0]    # min max [rad/s]
-            heading = [-1.6, 1.6]
+            heading = [-np.pi/3, np.pi/3]  # -60° to +60° in radians
 
         class crclm_incremnt:
             lin_vel_x = 0.1 # min max [m/s]
@@ -281,17 +293,17 @@ class WfTron1aCfg(LeggedRobotCfg):
             tracking_yaw = 0.5
             # regularization rewards
             lin_vel_z = -1.0
-            #ang_vel_xy = -0.05
+            ang_vel_xy = -0.05
             orientation = -1.
             dof_acc = -2.5e-7
-            collision = -10.
+            collision = -50.
             action_rate = -0.1
             delta_torques = -1.0e-7
             torques = -0.00001
             #hip_pos = -0.5
             #dof_error = -0.04
-            feet_stumble = -1
-            feet_edge = -1
+            #feet_stumble = -1
+            #feet_edge = -1
             
         only_positive_rewards = True # if true negative total rewards are clipped at zero (avoids early termination problems)
         tracking_sigma = 0.2 # tracking reward = exp(-error^2/sigma)

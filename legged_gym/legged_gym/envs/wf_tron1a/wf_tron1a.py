@@ -376,7 +376,12 @@ class WfTron1a(LeggedRobot):
                 cv2.waitKey(1)
 
     def check_termination(self):
-        """Check if environments need to be reset, including termination contacts."""
+        """Check if environments need to be reset, including contacts and out-of-bounds.
+        
+        - Uses base terminations (roll, pitch, height, timeout)
+        - Adds contact-based terminations on specified bodies
+        - Adds an out-of-bounds termination when the robot leaves its terrain tile (no penalty, timeout-like)
+        """
         # Call parent method to get standard terminations (roll, pitch, height, timeout)
         super().check_termination()
         
@@ -386,6 +391,21 @@ class WfTron1a(LeggedRobot):
             termination_contacts = torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 0.1
             termination_contact_cutoff = torch.any(termination_contacts, dim=-1)
             self.reset_buf |= termination_contact_cutoff
+        
+        # Out-of-bounds termination relative to the environment origin (per-tile limits)
+        # Approximate each env's valid area as a rectangle centered at env_origins
+        # with half-extent based on terrain_length and terrain_width.
+        if hasattr(self.cfg, "terrain") and hasattr(self.cfg.terrain, "terrain_length"):
+            rel_pos = self.root_states[:, :2] - self.env_origins[:, :2]
+            x_limit = 0.5 * self.cfg.terrain.terrain_length
+            y_limit = 0.5 * self.cfg.terrain.terrain_width
+            out_x = torch.abs(rel_pos[:, 0]) > x_limit
+            out_y = torch.abs(rel_pos[:, 1]) > y_limit
+            out_of_bounds = out_x | out_y
+
+            # Treat out-of-bounds as a timeout-like termination: no extra penalty
+            self.time_out_buf |= out_of_bounds
+            self.reset_buf |= out_of_bounds
 
     def reindex(self, vec):
         return vec  # if your URDF order is already what you want
@@ -570,7 +590,6 @@ class WfTron1a(LeggedRobot):
     
     def _reward_lin_vel_z(self):
         rew = torch.square(self.base_lin_vel[:, 2])
-        rew[self.env_class != 17] *= 0.5
         return rew
     
     def _reward_ang_vel_xy(self):
@@ -578,7 +597,6 @@ class WfTron1a(LeggedRobot):
      
     def _reward_orientation(self):
         rew = torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
-        rew[self.env_class != 17] = 0.
         return rew
 
     def _reward_dof_acc(self):
