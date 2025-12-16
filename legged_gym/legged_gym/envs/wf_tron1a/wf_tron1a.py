@@ -284,6 +284,25 @@ class WfTron1a(LeggedRobot):
                                             self.cfg.depth.resized[1], 
                                             self.cfg.depth.resized[0]).to(self.device)
 
+    def _reset_dofs(self, env_ids):
+        """Override DOF reset to use exactly the default joint angles (no randomization).
+
+        This keeps tron1a's joints at the configuration specified in
+        WfTron1aCfg.init_state.default_joint_angles when environments are reset.
+        """
+        # Positions: copy default_dof_pos_all for the selected envs
+        self.dof_pos[env_ids] = self.default_dof_pos_all[env_ids]
+        # Velocities: zero
+        self.dof_vel[env_ids] = 0.0
+
+        env_ids_int32 = env_ids.to(dtype=torch.int32)
+        self.gym.set_dof_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.dof_state),
+            gymtorch.unwrap_tensor(env_ids_int32),
+            len(env_ids_int32),
+        )
+
 
 
     def post_physics_step(self):

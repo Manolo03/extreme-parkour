@@ -131,17 +131,38 @@ class Terrain:
 
     def selected_terrain(self):
         terrain_type = self.cfg.terrain_kwargs.pop('type')
+        terrain_params = self.cfg.terrain_kwargs.pop('terrain_kwargs', {})
         for k in range(self.cfg.num_sub_terrains):
             # Env coordinates in the world
             (i, j) = np.unravel_index(k, (self.cfg.num_rows, self.cfg.num_cols))
 
             terrain = terrain_utils.SubTerrain("terrain",
-                              width=self.width_per_env_pixels,
-                              length=self.length_per_env_pixels,
-                              vertical_scale=self.vertical_scale,
-                              horizontal_scale=self.horizontal_scale)
+                              width=self.length_per_env_pixels,
+                              length=self.width_per_env_pixels,
+                              vertical_scale=self.cfg.vertical_scale,
+                              horizontal_scale=self.cfg.horizontal_scale)
 
-            eval(terrain_type)(terrain, **self.cfg.terrain_kwargs.terrain_kwargs)
+            eval(terrain_type)(terrain, **terrain_params)
+            # Set idx attribute (required by add_terrain_to_map)
+            # Use 21 as a special index for custom/selected terrains
+            if not hasattr(terrain, 'idx'):
+                terrain.idx = 21
+            # Ensure goals attribute exists (some terrain functions may not set it)
+            if not hasattr(terrain, 'goals'):
+                terrain.goals = np.zeros((self.num_goals, 2))
+            else:
+                # If the terrain function returned a different number of goals,
+                # pad or truncate to match self.num_goals to avoid shape errors.
+                g = np.asarray(terrain.goals)
+                if g.ndim == 1:
+                    g = g.reshape(1, -1)
+                if g.shape[0] < self.num_goals:
+                    pad = np.zeros((self.num_goals - g.shape[0], g.shape[1]), dtype=g.dtype)
+                    pad[:] = g[-1]  # repeat last goal
+                    g = np.concatenate([g, pad], axis=0)
+                elif g.shape[0] > self.num_goals:
+                    g = g[:self.num_goals]
+                terrain.goals = g[:, :2]
             self.add_terrain_to_map(terrain, i, j)
     
     def add_roughness(self, terrain, difficulty=1):
@@ -867,6 +888,287 @@ def stepping_stones_terrain(terrain, stone_size, stone_distance, max_height, pla
     y1 = (terrain.length - platform_size) // 2
     y2 = (terrain.length + platform_size) // 2
     terrain.height_field_raw[x1:x2, y1:y2] = 0
+    return terrain
+
+def bump_field_terrain(terrain, 
+                       bump_size_range=[0.2, 0.4],
+                       bump_spacing=0.35,
+                       max_height=0.2,
+                       platform_len=1.5,
+                       platform_height=0.):
+    """
+    Generate a dense bump field (uniform grid of bumps) across the terrain.
+    
+    Parameters:
+        terrain (SubTerrain): the terrain object to modify
+        bump_size_range (list): [min, max] radius of bumps in meters
+        bump_spacing (float): center-to-center spacing between bumps in meters
+        max_height (float): maximum height of bumps (similar to stepping_stones) [meters]
+        platform_len (float): length of starting platform [meters]
+        platform_height (float): height of starting platform [meters]
+    Returns:
+        terrain (SubTerrain): updated terrain with goals set
+    """
+    mid_y = terrain.length // 2  # lateral center
+    
+    # Convert to pixel units
+    max_height_int = int(max_height / terrain.vertical_scale)
+    platform_len_px = max(1, round(platform_len / terrain.horizontal_scale))
+    platform_height_px = round(platform_height / terrain.vertical_scale)
+    bump_spacing_px = round(bump_spacing / terrain.horizontal_scale)
+    
+    # Initialize terrain to ground level
+    terrain.height_field_raw[:, :] = 0
+    
+    # Create starting platform centered around the environment origin (tile center)
+    # height_field_raw is indexed as [x (forward), y (lateral)]
+    mid_x = terrain.width // 2
+    x_start = max(0, mid_x - platform_len_px // 2)
+    x_end = min(terrain.width, x_start + platform_len_px)
+    terrain.height_field_raw[x_start:x_end, :] = platform_height_px
+    
+    # Create a dense grid of bumps across the entire terrain (after platform)
+    # Use coordinate grids for efficient computation
+    x_coords, y_coords = np.ogrid[:terrain.width, :terrain.length]
+    
+    # Create bump centers in a grid pattern
+    bump_centers_x = []
+    bump_centers_y = []
+    
+    # Start bumps after the platform end
+    start_x = x_end
+    # Create grid of bumps
+    x_pos = start_x
+    while x_pos < terrain.width:
+        y_pos = bump_spacing_px // 2  # Start slightly offset from edge
+        while y_pos < terrain.length:
+            bump_centers_x.append(x_pos)
+            bump_centers_y.append(y_pos)
+            y_pos += bump_spacing_px
+        x_pos += bump_spacing_px
+    
+    # Create all bumps
+    for bump_x, bump_y in zip(bump_centers_x, bump_centers_y):
+        # Random bump size and height for variety
+        bump_radius = np.random.uniform(bump_size_range[0], bump_size_range[1])
+        bump_radius_px = round(bump_radius / terrain.horizontal_scale)
+        bump_height = np.random.randint(0, max_height_int + 1)
+        
+        # Calculate distance from this bump center
+        x_dist = x_coords - bump_x
+        y_dist = y_coords - bump_y
+        distance_squared = x_dist**2 + y_dist**2
+        
+        # Create bump shape (circular base with height falloff)
+        bump_mask = distance_squared <= bump_radius_px**2
+        
+        # Create height profile: higher at center, lower at edges
+        # Use a smooth falloff (cosine-like) for more natural bumps
+        normalized_dist = np.sqrt(distance_squared) / bump_radius_px
+        normalized_dist = np.clip(normalized_dist, 0, 1)
+        # Cosine falloff: height = max_height * (1 - normalized_dist^2)
+        height_profile = bump_height * (1 - normalized_dist**2)
+        height_profile = height_profile.astype(np.int16)
+        
+        # Apply bump height only where mask is True (use maximum to handle overlapping bumps)
+        terrain.height_field_raw[bump_mask] = np.maximum(
+            terrain.height_field_raw[bump_mask], 
+            height_profile[bump_mask]
+        )
+    
+    # Add some roughness to the surface (like other terrains)
+    # Small random height variations across the entire terrain
+    roughness = np.random.randint(-1, 2, size=terrain.height_field_raw.shape, dtype=np.int16)
+    terrain.height_field_raw = np.clip(terrain.height_field_raw + roughness, 0, None)
+    
+    # Set simple goals: start, middle, end
+    goals = np.zeros((3, 2))
+    # Center of platform in meters
+    platform_center_x = (x_start + x_end) * terrain.horizontal_scale * 0.5
+    goals[0] = [platform_center_x, mid_y * terrain.horizontal_scale]
+    goals[1] = [platform_center_x + 1.0, mid_y * terrain.horizontal_scale]
+    goals[2] = [terrain.width * terrain.horizontal_scale - round(1.0 / terrain.horizontal_scale), mid_y * terrain.horizontal_scale]
+    terrain.goals = goals
+    
+    return terrain
+
+def wall_terrain(terrain,
+                 min_height=0.3,
+                 max_height=1.0,
+                 max_yaw_deg=90.0,
+                 thickness=0.6,
+                 platform_len=1.5,
+                 platform_height=0.0,
+                 yaw_deg=None):
+    """
+    Generate a single wall of varying height and yaw.
+
+    The wall:
+    - Has height sampled uniformly between [min_height, max_height] (meters)
+    - Has yaw sampled uniformly in [-max_yaw_deg, max_yaw_deg] degrees
+      (0° = perpendicular to robot forward direction; ±90° = parallel)
+    - Has a finite thickness (meters) around the wall center line
+    - Is placed after a flat start platform of length platform_len
+    """
+    # Convert to discrete units
+    min_h_int = int(min_height / terrain.vertical_scale)
+    max_h_int = max(int(max_height / terrain.vertical_scale), min_h_int + 1)
+    wall_height_int = np.random.randint(min_h_int, max_h_int + 1)
+
+    platform_len_px = max(1, int(platform_len / terrain.horizontal_scale))
+    platform_height_px = int(platform_height / terrain.vertical_scale)
+    half_thickness_px = max(1, int(thickness / terrain.horizontal_scale / 2.0))
+
+    # Initialize flat ground
+    terrain.height_field_raw[:, :] = 0
+
+    # Start platform (flat), centered around tile center so robot stands in the middle
+    mid_x = terrain.width // 2
+    platform_start = max(0, mid_x - platform_len_px // 2)
+    platform_end = min(terrain.width, platform_start + platform_len_px)
+    terrain.height_field_raw[platform_start:platform_end, :] = platform_height_px
+
+    # Wall center further after platform, in the middle laterally (distance scaled down)
+    extra_offset_px = max(int(1.0 / terrain.horizontal_scale), half_thickness_px * 2)
+    cx = platform_end + extra_offset_px
+    cx = min(cx, terrain.width - half_thickness_px - 2)
+    cy = terrain.length // 2
+
+    # Sample or fix yaw angle in radians
+    if yaw_deg is None:
+        yaw_rad = np.deg2rad(np.random.uniform(-max_yaw_deg, max_yaw_deg))
+    else:
+        yaw_rad = np.deg2rad(yaw_deg)
+
+    # Special case: yaw ≈ 0 => axis-aligned wall (two parallel faces) with no quirks
+    if abs(np.sin(yaw_rad)) < 1e-3:
+        # Make a rectangular slab [x0:x1] × all y
+        x0 = max(platform_end + half_thickness_px, 0)
+        x1 = min(x0 + 2 * half_thickness_px, terrain.width)
+        terrain.height_field_raw[x0:x1, :] = wall_height_int
+    else:
+        # General yaw: use distance-to-line band
+        # Direction vector along the wall
+        dx = np.cos(yaw_rad)
+        dy = np.sin(yaw_rad)
+
+        # Coordinate grids (x forward, y lateral)
+        x_coords, y_coords = np.meshgrid(np.arange(terrain.width),
+                                         np.arange(terrain.length),
+                                         indexing='ij')
+
+        # Vector from wall center to each point
+        vx = x_coords - cx
+        vy = y_coords - cy
+
+        # Signed distance to infinite line through (cx, cy) with direction (dx, dy)
+        # In 2D, distance magnitude = |v x d| / ||d||, but here ||d|| = 1
+        # v x d (scalar in 2D) = vx * dy - vy * dx
+        cross = vx * dy - vy * dx
+        dist = np.abs(cross)
+
+        # Limit wall extent roughly to the usable terrain region (avoid painting over start platform)
+        wall_mask = (dist <= half_thickness_px) & (x_coords >= platform_len_px)
+
+        # Raise the wall; keep maximum in case of future modifications
+        terrain.height_field_raw[wall_mask] = np.maximum(
+            terrain.height_field_raw[wall_mask],
+            wall_height_int
+        )
+
+    # Define simple goals: before wall and after wall
+    goals = np.zeros((2, 2))
+    mid_y = cy
+    # approximate platform center in meters
+    platform_center_x = (platform_start + platform_end) * terrain.horizontal_scale * 0.5
+    goals[0] = [platform_center_x, mid_y * terrain.horizontal_scale]
+    goals[1] = [(terrain.width - 1) * terrain.horizontal_scale, mid_y * terrain.horizontal_scale]
+    terrain.goals = goals
+
+    return terrain
+
+def sloped_wall_terrain(terrain,
+                        min_height=0.3,
+                        max_height=1.0,
+                        slope_len_range=(1.0, 2.0),
+                        platform_len=0.5,
+                        platform_height=None):
+    """
+    Generate a "wall" whose faces are slopes:
+      - one up-slope,
+      - followed by a flat platform (0.5 m by default),
+      - followed by a down-slope.
+
+    All heights (slopes and platform) are randomized in the same range as wall_terrain.
+    """
+    # Convert to discrete units
+    min_h_int = int(min_height / terrain.vertical_scale)
+    max_h_int = max(int(max_height / terrain.vertical_scale), min_h_int + 1)
+
+    # Sample platform height in the same range as wall_terrain
+    platform_h_int = np.random.randint(min_h_int, max_h_int + 1)
+
+    # Choose a single slope angle between 20° and 90° and derive the slope length
+    # from the platform height so both faces have the same angle.
+    angle_deg = np.random.uniform(20.0, 90.0)
+    angle_rad = np.deg2rad(angle_deg)
+    height_m = platform_h_int * terrain.vertical_scale
+    # For very steep walls (angle → 90°), avoid division by ~0; cap the minimum tan.
+    tan_theta = max(np.tan(angle_rad), 1e-3)
+    slope_len_m = height_m / tan_theta
+    slope_len_px = max(1, int(slope_len_m / terrain.horizontal_scale))
+
+    # Force the top platform to always be exactly 0.5 m wide (in meters),
+    # regardless of the platform_len argument.
+    platform_len_m = 0.5
+    platform_len_px = max(1, int(platform_len_m / terrain.horizontal_scale))
+
+    # Initialize flat ground
+    terrain.height_field_raw[:, :] = 0
+
+    # Start platform for the robot, centered around tile center (as in wall_terrain)
+    mid_x = terrain.width // 2
+    start_platform_len_px = max(1, int(1.5 / terrain.horizontal_scale))  # 1.5 m start platform
+    start_platform_start = max(0, mid_x - start_platform_len_px // 2)
+    start_platform_end = min(terrain.width, start_platform_start + start_platform_len_px)
+    start_platform_h_int = int(0.0 / terrain.vertical_scale)  # flat at 0 height
+    terrain.height_field_raw[start_platform_start:start_platform_end, :] = start_platform_h_int
+
+    # Place sloped "wall" feature after the start platform, along x.
+    # Ensure the full [up-slope][platform][down-slope] fits so both slopes
+    # have exactly the same number of cells.
+    gap_px = max(1, int(1.0 / terrain.horizontal_scale))  # small gap after platform
+    total_feature_px = 2 * slope_len_px + platform_len_px
+    max_x0 = max(0, terrain.width - total_feature_px)
+    x0 = min(start_platform_end + gap_px, max_x0)
+    x1 = x0 + slope_len_px
+    x2 = x1 + platform_len_px
+    x3 = x2 + slope_len_px
+
+    # Up-slope: ramp from 0 up to platform_h_int
+    if x1 > x0:
+        ramp = np.linspace(0, platform_h_int, x1 - x0, endpoint=False).astype(np.int16)
+        ramp = ramp[:, None]  # shape (len,1)
+        terrain.height_field_raw[x0:x1, :] = np.maximum(terrain.height_field_raw[x0:x1, :], ramp)
+
+    # Flat platform at platform_h_int
+    terrain.height_field_raw[x1:x2, :] = platform_h_int
+
+    # Down-slope: ramp back down to 0
+    if x3 > x2:
+        ramp_down = np.linspace(platform_h_int, 0, x3 - x2, endpoint=False).astype(np.int16)
+        ramp_down = ramp_down[:, None]
+        terrain.height_field_raw[x2:x3, :] = np.maximum(terrain.height_field_raw[x2:x3, :], ramp_down)
+
+    # Goals: before feature and after feature, in meters
+    goals = np.zeros((2, 2))
+    mid_y = terrain.length // 2
+    # Just before the first slope
+    goals[0] = [(start_platform_end * terrain.horizontal_scale), mid_y * terrain.horizontal_scale]
+    # Just after the second slope
+    goals[1] = [(x3 * terrain.horizontal_scale), mid_y * terrain.horizontal_scale]
+    terrain.goals = goals
+
     return terrain
 
 def convert_heightfield_to_trimesh_delatin(height_field_raw, horizontal_scale, vertical_scale, max_error=0.01):
