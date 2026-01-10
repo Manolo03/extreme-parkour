@@ -242,11 +242,10 @@ class WfTron1a(LeggedRobot):
         self.contact_buf = torch.zeros(self.num_envs, self.cfg.env.contact_buf_len, 2, device=self.device, dtype=torch.float)
 
         self.commands = torch.zeros(self.num_envs, self.cfg.commands.num_commands, dtype=torch.float, device=self.device, requires_grad=False) # x vel, y vel, yaw vel, heading
-        self._resample_commands(torch.arange(self.num_envs, device=self.device, requires_grad=False))
-        self.commands_scale = torch.tensor([self.obs_scales.lin_vel, self.obs_scales.lin_vel, self.obs_scales.ang_vel], device=self.device, requires_grad=False,) # TODO change this
-
+        
         # Sample a fixed heading target per environment (in radians), which stays
         # constant across resets and command resampling. Use the same range as the command heading.
+        # Initialize BEFORE _resample_commands so it can restore heading_target_initial.
         if self.cfg.commands.curriculum:
             heading_range = (self.cfg.commands.ranges.heading[0], self.cfg.commands.ranges.heading[1])
         else:
@@ -256,6 +255,9 @@ class WfTron1a(LeggedRobot):
         ).squeeze(1)
         # Store initial heading_target so it can be restored on command resampling
         self.heading_target_initial = self.heading_target.clone()
+        
+        self._resample_commands(torch.arange(self.num_envs, device=self.device, requires_grad=False))
+        self.commands_scale = torch.tensor([self.obs_scales.lin_vel, self.obs_scales.lin_vel, self.obs_scales.ang_vel], device=self.device, requires_grad=False,) # TODO change this
 
         self.feet_air_time = torch.zeros(self.num_envs, self.feet_indices.shape[0], dtype=torch.float, device=self.device, requires_grad=False)
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
@@ -297,6 +299,80 @@ class WfTron1a(LeggedRobot):
                                             self.cfg.depth.buffer_len, 
                                             self.cfg.depth.resized[1], 
                                             self.cfg.depth.resized[0]).to(self.device)
+
+    def _get_env_origins(self):
+        """Override to ensure at least one environment per terrain tile.
+        
+        The base class randomly assigns terrain_levels, which can result in
+        some tiles having multiple robots and others having none. This override
+        ensures each tile gets at least one environment before any tile gets a second.
+        """
+        if self.cfg.terrain.mesh_type in ["heightfield", "trimesh"]:
+            self.custom_origins = True
+            self.env_origins = torch.zeros(self.num_envs, 3, device=self.device, requires_grad=False)
+            self.env_class = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
+            
+            # Calculate total number of terrain tiles
+            num_tiles = self.cfg.terrain.num_rows * self.cfg.terrain.num_cols
+            max_init_level = self.cfg.terrain.max_init_terrain_level
+            if not self.cfg.terrain.curriculum:
+                max_init_level = self.cfg.terrain.num_rows - 1
+            
+            # Initialize terrain_levels and terrain_types
+            self.terrain_levels = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            self.terrain_types = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            
+            # First, assign one environment to each tile (guaranteed coverage)
+            # Create all (level, type) combinations
+            all_levels = []
+            all_types = []
+            for level in range(max_init_level + 1):
+                for col_type in range(self.cfg.terrain.num_cols):
+                    all_levels.append(level)
+                    all_types.append(col_type)
+            
+            # Convert to tensors and shuffle using torch
+            if len(all_levels) > 0:
+                all_levels_tensor = torch.tensor(all_levels, dtype=torch.long, device=self.device)
+                all_types_tensor = torch.tensor(all_types, dtype=torch.long, device=self.device)
+                
+                # Shuffle indices
+                shuffle_idx = torch.randperm(len(all_levels), device=self.device)
+                all_levels_tensor = all_levels_tensor[shuffle_idx]
+                all_types_tensor = all_types_tensor[shuffle_idx]
+                
+                # Assign first min(num_envs, num_tiles) environments to unique tiles
+                num_to_assign = min(self.num_envs, len(all_levels))
+                self.terrain_levels[:num_to_assign] = all_levels_tensor[:num_to_assign]
+                self.terrain_types[:num_to_assign] = all_types_tensor[:num_to_assign]
+            else:
+                num_to_assign = 0
+            
+            # For remaining environments (if num_envs > num_tiles), assign randomly
+            if self.num_envs > num_to_assign:
+                remaining_levels = torch.randint(0, max_init_level + 1, (self.num_envs - num_to_assign,), device=self.device)
+                remaining_types = torch.randint(0, self.cfg.terrain.num_cols, (self.num_envs - num_to_assign,), device=self.device)
+                self.terrain_levels[num_to_assign:] = remaining_levels
+                self.terrain_types[num_to_assign:] = remaining_types
+            
+            self.max_terrain_level = self.cfg.terrain.num_rows
+            self.terrain_origins = torch.from_numpy(self.terrain.env_origins).to(self.device).to(torch.float)
+            self.env_origins[:] = self.terrain_origins[self.terrain_levels, self.terrain_types]
+            
+            self.terrain_class = torch.from_numpy(self.terrain.terrain_type).to(self.device).to(torch.float)
+            self.env_class[:] = self.terrain_class[self.terrain_levels, self.terrain_types]
+
+            self.terrain_goals = torch.from_numpy(self.terrain.goals).to(self.device).to(torch.float)
+            self.env_goals = torch.zeros(self.num_envs, self.cfg.terrain.num_goals + self.cfg.env.num_future_goal_obs, 3, device=self.device, requires_grad=False)
+            self.cur_goal_idx = torch.zeros(self.num_envs, device=self.device, requires_grad=False, dtype=torch.long)
+            temp = self.terrain_goals[self.terrain_levels, self.terrain_types]
+            last_col = temp[:, -1].unsqueeze(1)
+            self.env_goals[:] = torch.cat((temp, last_col.repeat(1, self.cfg.env.num_future_goal_obs, 1)), dim=1)[:]
+            self.cur_goals = self._gather_cur_goals()
+            self.next_goals = self._gather_cur_goals(future=1)
+        else:
+            # For non-terrain modes, call parent method
+            super()._get_env_origins()
 
     def _reset_dofs(self, env_ids):
         """Override DOF reset to use exactly the default joint angles (no randomization).
@@ -385,11 +461,22 @@ class WfTron1a(LeggedRobot):
         # Call parent method to get standard terminations (roll, pitch, height, timeout)
         super().check_termination()
         
+        # Debug: print termination reasons for lookat_id
+        if hasattr(self, 'lookat_id') and self.reset_buf[self.lookat_id]:
+            print(f"Termination triggered for env {self.lookat_id}:")
+            print(f"  Episode length: {self.episode_length_buf[self.lookat_id].item()}/{self.max_episode_length} steps ({self.episode_length_buf[self.lookat_id].item() * self.dt:.2f}/{self.max_episode_length_s:.1f} seconds)")
+            print(f"  Roll: {self.roll[self.lookat_id]:.3f} (limit: ±1.5)")
+            print(f"  Pitch: {self.pitch[self.lookat_id]:.3f} (limit: ±1.5)")
+            print(f"  Height: {self.root_states[self.lookat_id, 2]:.3f} (limit: >-0.25)")
+            print(f"  Timeout: {self.time_out_buf[self.lookat_id]}")
+        
         # Add termination contact check (base class doesn't implement this!)
         if hasattr(self, 'termination_contact_indices') and len(self.termination_contact_indices) > 0:
             # Check if any termination contact bodies are touching the ground
             termination_contacts = torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 0.1
             termination_contact_cutoff = torch.any(termination_contacts, dim=-1)
+            if hasattr(self, 'lookat_id') and termination_contact_cutoff[self.lookat_id]:
+                print(f"  Contact termination: abad/base touching ground")
             self.reset_buf |= termination_contact_cutoff
         
         # Out-of-bounds termination relative to the environment origin (per-tile limits)
@@ -403,12 +490,28 @@ class WfTron1a(LeggedRobot):
             out_y = torch.abs(rel_pos[:, 1]) > y_limit
             out_of_bounds = out_x | out_y
 
+            if hasattr(self, 'lookat_id') and out_of_bounds[self.lookat_id]:
+                print(f"  Out-of-bounds: x={rel_pos[self.lookat_id, 0]:.3f} (limit: ±{x_limit:.1f}), "
+                      f"y={rel_pos[self.lookat_id, 1]:.3f} (limit: ±{y_limit:.1f})")
+
             # Treat out-of-bounds as a timeout-like termination: no extra penalty
             self.time_out_buf |= out_of_bounds
             self.reset_buf |= out_of_bounds
 
     def reindex(self, vec):
         return vec  # if your URDF order is already what you want
+
+    def _push_robots(self):
+        """Override to push only perpendicular to the wall (lateral/y direction).
+        
+        The wall in sloped_wall_terrain is oriented along the x-axis (forward),
+        so we only push in the y-direction (lateral, perpendicular to wall).
+        """
+        max_vel = self.cfg.domain_rand.max_push_vel_xy
+        # Only push in y-direction (lateral, perpendicular to wall)
+        # Keep x-velocity unchanged, only modify y-velocity
+        self.root_states[:, 8] = torch_rand_float(-max_vel, max_vel, (self.num_envs, 1), device=self.device).squeeze(1)  # lin vel y only
+        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
 
     def _compute_torques(self, actions):
         """
@@ -488,6 +591,54 @@ class WfTron1a(LeggedRobot):
                         pose,
                     )
 
+    def _draw_goals(self):
+        """
+        Override to draw green trail in heading direction instead of terrain goals.
+        Draws a trail of green spheres from the robot base in the direction of heading_target.
+        """
+        if self.cfg.depth.use_camera:
+            return  # Skip if using camera (same as base class)
+        
+        # Green trail spheres (same style as base class)
+        sphere_geom_arrow = gymutil.WireframeSphereGeometry(0.02, 16, 16, None, color=(0, 1, 0.5))
+        
+        # Get robot's current position
+        robot_pos = self.root_states[self.lookat_id, :3].cpu().numpy()
+        
+        # Get heading target angle (in radians)
+        heading_angle = self.heading_target[self.lookat_id].cpu().item()
+        
+        # Calculate direction vector from heading angle (normalized)
+        # heading_angle is the desired heading in world frame
+        direction_vec = np.array([np.cos(heading_angle), np.sin(heading_angle)])
+        
+        # Draw trail of 5 green spheres at increasing distances (same as base class)
+        for i in range(5):
+            # Distance increases: 0.2*(i+3) meters from robot
+            distance = 0.2 * (i + 3)
+            pose_arrow = robot_pos[:2] + distance * direction_vec
+            
+            # Get terrain height at this position if available
+            if hasattr(self, 'terrain') and self.terrain is not None and hasattr(self, 'height_samples'):
+                try:
+                    target_xy = pose_arrow.copy()
+                    if hasattr(self.terrain, 'cfg'):
+                        target_xy_grid = ((target_xy + self.terrain.cfg.border_size) / self.terrain.cfg.horizontal_scale).astype(int)
+                        # Clip to valid range
+                        target_xy_grid[0] = np.clip(target_xy_grid[0], 0, self.height_samples.shape[0] - 1)
+                        target_xy_grid[1] = np.clip(target_xy_grid[1], 0, self.height_samples.shape[1] - 1)
+                        sphere_z = self.height_samples[target_xy_grid[0], target_xy_grid[1]].cpu().item() * self.terrain.cfg.vertical_scale
+                    else:
+                        sphere_z = robot_pos[2]
+                except:
+                    sphere_z = robot_pos[2]
+            else:
+                sphere_z = robot_pos[2]
+            
+            # Draw green sphere
+            pose = gymapi.Transform(gymapi.Vec3(pose_arrow[0], pose_arrow[1], sphere_z), r=None)
+            gymutil.draw_lines(sphere_geom_arrow, self.gym, self.viewer, self.envs[self.lookat_id], pose)
+
     def compute_observations(self):
         """ 
         Computes observations
@@ -537,9 +688,7 @@ class WfTron1a(LeggedRobot):
         # Debug: check final observation size
         if self.common_step_counter == 1:
             print(f"  Final self.obs_buf.shape = {self.obs_buf.shape}, first 34 dims shape = {self.obs_buf[:, :34].shape}")
-        # Mask yaw in proprioceptive history using config-based indices
-        start_idx, length = self.cfg.env.obs_indices.get("yaw")
-        obs_buf[:, start_idx:start_idx + length] = 0 #is it useful to mask yaw error in history ?
+        # Update observation history (no masking of yaw error)
         self.obs_history_buf = torch.where(
             (self.episode_length_buf <= 1)[:, None, None], 
             torch.stack([obs_buf] * self.cfg.env.history_len, dim=1),
@@ -559,14 +708,30 @@ class WfTron1a(LeggedRobot):
         )
     
     def _resample_commands(self, env_ids):
-        """Override to restore the original heading_target instead of resampling it.
+        """Tron1a-specific command resampling.
         
-        The heading_target is fixed per environment (sampled once at initialization)
-        and should remain constant across command resampling. Later, when using
-        dynamic commands, heading_target will come from commands[:, 3] instead.
+        - Sample only forward velocity (lin_vel_x) from command_ranges
+        - Zero out lateral velocity, yaw rate, and heading commands
+        - Keep heading_target fixed per environment (restore from initial)
+        - No heading_command logic from base class
         """
-        # Call parent method to resample velocity commands
-        super()._resample_commands(env_ids)
+        if len(env_ids) == 0:
+            return
+        
+        # Sample forward velocity command
+        self.commands[env_ids, 0] = torch_rand_float(
+            self.command_ranges["lin_vel_x"][0],
+            self.command_ranges["lin_vel_x"][1],
+            (len(env_ids), 1),
+            device=self.device,
+        ).squeeze(1)
+        
+        # Zero out lateral velocity
+        self.commands[env_ids, 1:] = 0.0
+        
+        # Set small commands to zero (same clipping logic as base class)
+        self.commands[env_ids, :2] *= torch.abs(self.commands[env_ids, 0:1]) > self.cfg.commands.lin_vel_clip
+        
         # Restore the original heading_target for these environments
         self.heading_target[env_ids] = self.heading_target_initial[env_ids]
     

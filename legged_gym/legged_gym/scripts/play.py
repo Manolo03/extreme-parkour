@@ -66,36 +66,35 @@ def play(args):
     # override some parameters for testing
     if args.nodelay:
         env_cfg.domain_rand.action_delay_view = 0
-    env_cfg.env.num_envs = 16 if not args.save else 64
-    env_cfg.env.episode_length_s = 60
-    env_cfg.commands.resampling_time = 60
+    
+    # Match training environment: sloped_wall_terrain with 5x5 grid (instead of 10x40 for training)
+    env_cfg.terrain.curriculum = False
+    env_cfg.terrain.selected = True
     env_cfg.terrain.num_rows = 5
     env_cfg.terrain.num_cols = 5
-    env_cfg.terrain.height = [0.02, 0.02]
-    env_cfg.terrain.terrain_dict = {"smooth slope": 0., 
-                                    "rough slope up": 0.0,
-                                    "rough slope down": 0.0,
-                                    "rough stairs up": 0., 
-                                    "rough stairs down": 0., 
-                                    "discrete": 0., 
-                                    "stepping stones": 0.0,
-                                    "gaps": 0., 
-                                    "smooth flat": 0,
-                                    "pit": 0.0,
-                                    "wall": 0.0,
-                                    "platform": 0.,
-                                    "large stairs up": 0.,
-                                    "large stairs down": 0.,
-                                    "parkour": 0.2,
-                                    "parkour_hurdle": 0.2,
-                                    "parkour_flat": 0.,
-                                    "parkour_step": 0.2,
-                                    "parkour_gap": 0.2, 
-                                    "demo": 0.2}
     
-    env_cfg.terrain.terrain_proportions = list(env_cfg.terrain.terrain_dict.values())
-    env_cfg.terrain.curriculum = False
-    env_cfg.terrain.max_difficulty = True
+    # Ensure at least one environment per terrain tile
+    min_num_envs = env_cfg.terrain.num_rows * env_cfg.terrain.num_cols  # 5 * 5 = 25
+    if args.save:
+        # When saving, use at least min_num_envs, but allow more if desired
+        env_cfg.env.num_envs = max(64, min_num_envs)
+    else:
+        # For visualization, use exactly min_num_envs to have one per tile
+        env_cfg.env.num_envs = min_num_envs
+    
+    env_cfg.env.episode_length_s = 60
+    env_cfg.commands.resampling_time = 60
+    env_cfg.terrain.terrain_length = 10.0  # matches training
+    env_cfg.terrain.terrain_width = 30.0   # matches training
+    env_cfg.terrain.terrain_kwargs = {
+        "type": "sloped_wall_terrain",
+        "terrain_kwargs": {
+            "min_height": 0.3,
+            "max_height": 1.0,
+            "slope_len_range": (1.0, 2.0),
+            "platform_len": 0.5,
+        }
+    }
     
     env_cfg.depth.angle = [0, 1]
     env_cfg.noise.add_noise = True
@@ -130,7 +129,7 @@ def play(args):
     if env.cfg.depth.use_camera:
         depth_encoder = ppo_runner.get_depth_encoder_inference_policy(device=env.device)
 
-    actions = torch.zeros(env.num_envs, 12, device=env.device, requires_grad=False)
+    actions = torch.zeros(env.num_envs, env.num_actions, device=env.device, requires_grad=False)
     infos = {}
     infos["depth"] = env.depth_buffer.clone().to(ppo_runner.device)[:, -1] if ppo_runner.if_depth else None
 
