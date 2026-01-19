@@ -261,6 +261,7 @@ class WfTron1a(LeggedRobot):
 
         self.feet_air_time = torch.zeros(self.num_envs, self.feet_indices.shape[0], dtype=torch.float, device=self.device, requires_grad=False)
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
+        self.base_contact_termination = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
@@ -445,6 +446,7 @@ class WfTron1a(LeggedRobot):
             # self._draw_height_samples()
             self._draw_goals()
             self._draw_feet()
+            self._draw_terrain_limits()
             if self.cfg.depth.use_camera:
                 window_name = "Depth Image"
                 cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -461,38 +463,41 @@ class WfTron1a(LeggedRobot):
         # Call parent method to get standard terminations (roll, pitch, height, timeout)
         super().check_termination()
         
-        # Debug: print termination reasons for lookat_id
-        if hasattr(self, 'lookat_id') and self.reset_buf[self.lookat_id]:
-            print(f"Termination triggered for env {self.lookat_id}:")
-            print(f"  Episode length: {self.episode_length_buf[self.lookat_id].item()}/{self.max_episode_length} steps ({self.episode_length_buf[self.lookat_id].item() * self.dt:.2f}/{self.max_episode_length_s:.1f} seconds)")
-            print(f"  Roll: {self.roll[self.lookat_id]:.3f} (limit: ±1.5)")
-            print(f"  Pitch: {self.pitch[self.lookat_id]:.3f} (limit: ±1.5)")
-            print(f"  Height: {self.root_states[self.lookat_id, 2]:.3f} (limit: >-0.25)")
-            print(f"  Timeout: {self.time_out_buf[self.lookat_id]}")
-        
         # Add termination contact check (base class doesn't implement this!)
+        # Track base contact terminations separately for penalty
+        self.base_contact_termination[:] = False  # Reset flag at start of check
         if hasattr(self, 'termination_contact_indices') and len(self.termination_contact_indices) > 0:
             # Check if any termination contact bodies are touching the ground
             termination_contacts = torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 0.1
             termination_contact_cutoff = torch.any(termination_contacts, dim=-1)
-            if hasattr(self, 'lookat_id') and termination_contact_cutoff[self.lookat_id]:
-                print(f"  Contact termination: abad/base touching ground")
+            # Track base contact terminations specifically (for penalty)
+            self.base_contact_termination[:] = termination_contact_cutoff
             self.reset_buf |= termination_contact_cutoff
         
         # Out-of-bounds termination relative to the environment origin (per-tile limits)
-        # Approximate each env's valid area as a rectangle centered at env_origins
-        # with half-extent based on terrain_length and terrain_width.
+        # Forward limit: extend to include entire wall feature (up-slope + platform + down-slope)
+        #   Wall can extend up to terrain_length (10m) from terrain start
+        #   Origin is at terrain_start + 1.0m, so wall ends around +9m from origin
+        # Backward limit: prevent wall from previous terrain from being in red zone
+        #   Previous terrain's wall ends around its terrain_start + terrain_length
+        #   With 2m spacing, need to ensure we don't terminate before that point
+        # Lateral (y) limit prevents robots from interacting with adjacent terrain walls
         if hasattr(self.cfg, "terrain") and hasattr(self.cfg.terrain, "terrain_length"):
             rel_pos = self.root_states[:, :2] - self.env_origins[:, :2]
-            x_limit = 0.5 * self.cfg.terrain.terrain_length
-            y_limit = 0.5 * self.cfg.terrain.terrain_width
-            out_x = torch.abs(rel_pos[:, 0]) > x_limit
+            # Forward limit: wall feature can extend to end of terrain (10m), origin is +1m into terrain
+            # So relative to origin: +9m to include entire wall + slope after
+            x_limit_forward = self.cfg.terrain.terrain_length - 1.0  # 10m - 1m = 9m from origin
+            # Backward limit: prevent previous terrain's wall from being in termination zone
+            # Previous terrain ends at: (i-1)*terrain_spacing + terrain_length
+            # Current origin is at: i*terrain_spacing + 1.0
+            # Difference: terrain_spacing - terrain_length + 1.0 = 12 - 10 + 1 = 3m
+            # So previous terrain ends 3m behind current origin, set limit to -2m to be safe
+            x_limit_backward = -2.0  # Prevent previous terrain's wall from being in red zone
+            y_limit = 0.5 * self.cfg.terrain.terrain_width  # ±15m lateral
+            out_x_forward = rel_pos[:, 0] > x_limit_forward
+            out_x_backward = rel_pos[:, 0] < x_limit_backward
             out_y = torch.abs(rel_pos[:, 1]) > y_limit
-            out_of_bounds = out_x | out_y
-
-            if hasattr(self, 'lookat_id') and out_of_bounds[self.lookat_id]:
-                print(f"  Out-of-bounds: x={rel_pos[self.lookat_id, 0]:.3f} (limit: ±{x_limit:.1f}), "
-                      f"y={rel_pos[self.lookat_id, 1]:.3f} (limit: ±{y_limit:.1f})")
+            out_of_bounds = out_x_forward | out_x_backward | out_y
 
             # Treat out-of-bounds as a timeout-like termination: no extra penalty
             self.time_out_buf |= out_of_bounds
@@ -639,6 +644,75 @@ class WfTron1a(LeggedRobot):
             pose = gymapi.Transform(gymapi.Vec3(pose_arrow[0], pose_arrow[1], sphere_z), r=None)
             gymutil.draw_lines(sphere_geom_arrow, self.gym, self.viewer, self.envs[self.lookat_id], pose)
 
+    def _draw_terrain_limits(self):
+        """Draw a red rectangle showing the terrain boundaries where termination occurs."""
+        if not hasattr(self.cfg, "terrain") or not hasattr(self.cfg.terrain, "terrain_length"):
+            return
+        
+        # Get terrain limits (matching termination conditions)
+        x_limit_forward = self.cfg.terrain.terrain_length - 1.0  # 9m forward (includes entire wall + slope)
+        x_limit_backward = -2.0  # -2m backward (prevents previous terrain's wall from being in red zone)
+        y_limit = 0.5 * self.cfg.terrain.terrain_width   # ±15m lateral
+        
+        # Get environment origin for the lookat environment
+        env_origin = self.env_origins[self.lookat_id].cpu().numpy()
+        
+        # Calculate rectangle corners (relative to env_origin, then add env_origin)
+        corners = [
+            [env_origin[0] + x_limit_backward, env_origin[1] - y_limit],  # bottom-left
+            [env_origin[0] + x_limit_forward, env_origin[1] - y_limit],  # bottom-right
+            [env_origin[0] + x_limit_forward, env_origin[1] + y_limit],  # top-right
+            [env_origin[0] + x_limit_backward, env_origin[1] + y_limit],  # top-left
+        ]
+        
+        # Get terrain height at corners (use base height as reference)
+        base_height = self.root_states[self.lookat_id, 2].cpu().item()
+        z_height = base_height - 0.1  # Draw slightly below robot base
+        
+        # Create red sphere geometry for corners
+        corner_geom = gymutil.WireframeSphereGeometry(0.1, 8, 8, None, color=(1, 0, 0))
+        
+        # Draw corners
+        for corner in corners:
+            pose = gymapi.Transform(gymapi.Vec3(corner[0], corner[1], z_height), r=None)
+            gymutil.draw_lines(corner_geom, self.gym, self.viewer, self.envs[self.lookat_id], pose)
+        
+        # Draw lines connecting corners to form rectangle
+        # Use small spheres along the edges to create visible lines
+        line_geom = gymutil.WireframeSphereGeometry(0.05, 4, 4, None, color=(1, 0, 0))
+        
+        # Bottom edge
+        for i in range(20):
+            t = i / 19.0
+            x = corners[0][0] + t * (corners[1][0] - corners[0][0])
+            y = corners[0][1]
+            pose = gymapi.Transform(gymapi.Vec3(x, y, z_height), r=None)
+            gymutil.draw_lines(line_geom, self.gym, self.viewer, self.envs[self.lookat_id], pose)
+        
+        # Top edge
+        for i in range(20):
+            t = i / 19.0
+            x = corners[3][0] + t * (corners[2][0] - corners[3][0])
+            y = corners[3][1]
+            pose = gymapi.Transform(gymapi.Vec3(x, y, z_height), r=None)
+            gymutil.draw_lines(line_geom, self.gym, self.viewer, self.envs[self.lookat_id], pose)
+        
+        # Left edge
+        for i in range(20):
+            t = i / 19.0
+            x = corners[0][0]
+            y = corners[0][1] + t * (corners[3][1] - corners[0][1])
+            pose = gymapi.Transform(gymapi.Vec3(x, y, z_height), r=None)
+            gymutil.draw_lines(line_geom, self.gym, self.viewer, self.envs[self.lookat_id], pose)
+        
+        # Right edge
+        for i in range(20):
+            t = i / 19.0
+            x = corners[1][0]
+            y = corners[1][1] + t * (corners[2][1] - corners[1][1])
+            pose = gymapi.Transform(gymapi.Vec3(x, y, z_height), r=None)
+            gymutil.draw_lines(line_geom, self.gym, self.viewer, self.envs[self.lookat_id], pose)
+
     def compute_observations(self):
         """ 
         Computes observations
@@ -778,6 +852,13 @@ class WfTron1a(LeggedRobot):
     
     def _reward_torques(self):
         return torch.sum(torch.square(self.torques), dim=1)
+    
+    def _reward_base_contact_termination(self):
+        """Penalty for falling (base link contact with ground).
+        Returns 1.0 when base contact causes termination, 0.0 otherwise.
+        Should be multiplied by a large negative scale (e.g., -100.0).
+        """
+        return self.base_contact_termination.float()
 
     def _reward_hip_pos(self):
         return torch.sum(torch.square(self.dof_pos[:, self.hip_indices] - self.default_dof_pos[:, self.hip_indices]), dim=1)

@@ -210,8 +210,8 @@ class WfTron1aCfg(LeggedRobotCfg):
         # start platform (1.5m) + gap (1.0m) + feature (2×slope + 0.5m platform, ~6m worst case) + buffer
         terrain_length = 10.0  # meters (forward direction, x-axis)
         terrain_width = 30.0   # meters (lateral direction, y-axis) - matches visualize_terrain.py
-        num_rows = 9  # number of terrain rows (levels)
-        num_cols = 10  # number of terrain cols (types)
+        num_rows = 8  # number of terrain rows (levels)
+        num_cols = 8  # number of terrain cols (types)
         
         terrain_dict = {"smooth slope": 0., 
                         "rough slope up": 0.0,
@@ -285,9 +285,9 @@ class WfTron1aCfg(LeggedRobotCfg):
         collapse_fixed_joints = False
 
     class domain_rand(LeggedRobotCfg.domain_rand):
-        push_robots = False
+        push_robots = True
         push_interval_s = 5.0  # Push every 5 seconds (perpendicular to wall)
-        max_push_vel_xy = 0.5  # Max push velocity in m/s
+        max_push_vel_xy = 2.0  # Max push velocity in m/s
 
     class rewards(LeggedRobotCfg.rewards):
         soft_dof_pos_limit = 0.95
@@ -305,6 +305,8 @@ class WfTron1aCfg(LeggedRobotCfg):
             action_rate = -0.1
             delta_torques = -1.0e-7
             torques = -0.00001
+            # termination penalty (only for base contact falls)
+            base_contact_termination = -50.0
             #hip_pos = -0.5
             #dof_error = -0.04
             #feet_stumble = -1

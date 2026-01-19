@@ -61,10 +61,15 @@ class Terrain:
 
         self.width_per_env_pixels = int(self.env_width / cfg.horizontal_scale)
         self.length_per_env_pixels = int(self.env_length / cfg.horizontal_scale)
+        
+        # Add spacing between terrains on x-axis (2m buffer)
+        self.terrain_spacing = self.env_length + 2.0  # 12m total spacing per terrain
+        self.spacing_pixels = int(2.0 / cfg.horizontal_scale)  # 2m buffer in pixels
 
         self.border = int(cfg.border_size/self.cfg.horizontal_scale)
         self.tot_cols = int(cfg.num_cols * self.width_per_env_pixels) + 2 * self.border
-        self.tot_rows = int(cfg.num_rows * self.length_per_env_pixels) + 2 * self.border
+        # Account for spacing between terrains on x-axis
+        self.tot_rows = int(cfg.num_rows * (self.length_per_env_pixels + self.spacing_pixels)) + 2 * self.border
 
         self.height_field_raw = np.zeros((self.tot_rows , self.tot_cols), dtype=np.int16)
         if cfg.curriculum:
@@ -350,15 +355,29 @@ class Terrain:
     def add_terrain_to_map(self, terrain, row, col):
         i = row
         j = col
-        # map coordinate system
-        start_x = self.border + i * self.length_per_env_pixels
-        end_x = self.border + (i + 1) * self.length_per_env_pixels
+        # Separate terrains on x-axis to prevent robots from getting stuck on adjacent terrain walls
+        # Add spacing between terrains: each terrain gets its own space with buffer
+        # map coordinate system - add spacing between terrains on x-axis
+        start_x = self.border + i * (self.length_per_env_pixels + self.spacing_pixels)
+        end_x = start_x + self.length_per_env_pixels
         start_y = self.border + j * self.width_per_env_pixels
         end_y = self.border + (j + 1) * self.width_per_env_pixels
-        self.height_field_raw[start_x: end_x, start_y:end_y] = terrain.height_field_raw
+        
+        # Ensure we don't exceed height field bounds
+        end_x = min(end_x, self.height_field_raw.shape[0])
+        end_y = min(end_y, self.height_field_raw.shape[1])
+        
+        if start_x < self.height_field_raw.shape[0] and start_y < self.height_field_raw.shape[1]:
+            terrain_end_x = min(end_x - start_x, terrain.height_field_raw.shape[0])
+            terrain_end_y = min(end_y - start_y, terrain.height_field_raw.shape[1])
+            self.height_field_raw[start_x:start_x + terrain_end_x, start_y:start_y + terrain_end_y] = \
+                terrain.height_field_raw[:terrain_end_x, :terrain_end_y]
 
-        # env_origin_x = (i + 0.5) * self.env_length
-        env_origin_x = i * self.env_length + 1.0
+        # Set environment origin: maintain same absolute position as before (ignoring border for origin calc)
+        # Old: env_origin_x = i * env_length + 1.0
+        # New: use same pattern with terrain_spacing to keep wall at same distance from spawn
+        # Note: border_size affects terrain mesh but origins use this simpler calculation
+        env_origin_x = i * self.terrain_spacing + 1.0  # Same as old: i*10+1.0, now i*12+1.0
         env_origin_y = (j + 0.5) * self.env_width
         x1 = int((self.env_length/2. - 0.5) / terrain.horizontal_scale) # within 1 meter square range
         x2 = int((self.env_length/2. + 0.5) / terrain.horizontal_scale)
@@ -370,7 +389,10 @@ class Terrain:
             env_origin_z = np.max(terrain.height_field_raw[x1:x2, y1:y2])*terrain.vertical_scale
         self.env_origins[i, j] = [env_origin_x, env_origin_y, env_origin_z]
         self.terrain_type[i, j] = terrain.idx
-        self.goals[i, j, :, :2] = terrain.goals + [i * self.env_length, j * self.env_width]
+        # Goals are relative to terrain start in world coordinates
+        # Terrain starts at: border_size + i * terrain_spacing in world coords
+        terrain_start_world_x = self.cfg.border_size + i * self.terrain_spacing
+        self.goals[i, j, :, :2] = terrain.goals + [terrain_start_world_x, j * self.env_width]
         # self.env_slope_vec[i, j] = terrain.slope_vector
 
 def gap_terrain(terrain, gap_size, platform_size=1.):
