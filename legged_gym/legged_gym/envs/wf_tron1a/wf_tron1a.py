@@ -262,6 +262,9 @@ class WfTron1a(LeggedRobot):
         self.feet_air_time = torch.zeros(self.num_envs, self.feet_indices.shape[0], dtype=torch.float, device=self.device, requires_grad=False)
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
         self.base_contact_termination = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        # Track push velocity for visualization (x, y components in world frame)
+        self.push_velocity = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False)
+        self.push_time_remaining = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)  # Time until push visualization fades
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
@@ -385,6 +388,10 @@ class WfTron1a(LeggedRobot):
         self.dof_pos[env_ids] = self.default_dof_pos_all[env_ids]
         # Velocities: zero
         self.dof_vel[env_ids] = 0.0
+        
+        # Reset push visualization for reset environments
+        self.push_velocity[env_ids] = 0.0
+        self.push_time_remaining[env_ids] = 0.0
 
         env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_dof_state_tensor_indexed(
@@ -440,6 +447,9 @@ class WfTron1a(LeggedRobot):
         self.last_dof_vel[:] = self.dof_vel[:]
         self.last_torques[:] = self.torques[:]
         self.last_root_vel[:] = self.root_states[:, 7:13]
+        
+        # Update push visualization timer (fade out over time)
+        self.push_time_remaining[:] = torch.clamp(self.push_time_remaining - self.dt, min=0.0)
 
         if self.viewer and self.enable_viewer_sync and self.debug_viz:
             self.gym.clear_lines(self.viewer)
@@ -447,6 +457,7 @@ class WfTron1a(LeggedRobot):
             self._draw_goals()
             self._draw_feet()
             self._draw_terrain_limits()
+            self._draw_push_arrow()
             if self.cfg.depth.use_camera:
                 window_name = "Depth Image"
                 cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -507,15 +518,21 @@ class WfTron1a(LeggedRobot):
         return vec  # if your URDF order is already what you want
 
     def _push_robots(self):
-        """Override to push only perpendicular to the wall (lateral/y direction).
+        """Override to push always in the positive x direction (forward).
         
-        The wall in sloped_wall_terrain is oriented along the x-axis (forward),
-        so we only push in the y-direction (lateral, perpendicular to wall).
+        Push force is always forward (positive x) to help the robot move forward.
         """
         max_vel = self.cfg.domain_rand.max_push_vel_xy
-        # Only push in y-direction (lateral, perpendicular to wall)
-        # Keep x-velocity unchanged, only modify y-velocity
-        self.root_states[:, 8] = torch_rand_float(-max_vel, max_vel, (self.num_envs, 1), device=self.device).squeeze(1)  # lin vel y only
+        # Push only in positive x-direction (forward)
+        push_vel_x = torch_rand_float(0.0, max_vel, (self.num_envs, 1), device=self.device).squeeze(1)  # lin vel x only, always positive
+        self.root_states[:, 7] = push_vel_x  # Set x velocity (index 7 is lin_vel_x)
+        
+        # Store push velocity for visualization (in world frame: x=push_vel_x, y=0)
+        self.push_velocity[:, 0] = push_vel_x
+        self.push_velocity[:, 1] = 0.0  # No y-component
+        # Show push visualization for 0.5 seconds
+        self.push_time_remaining[:] = 0.5
+        
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
 
     def _compute_torques(self, actions):
@@ -712,6 +729,69 @@ class WfTron1a(LeggedRobot):
             y = corners[1][1] + t * (corners[2][1] - corners[1][1])
             pose = gymapi.Transform(gymapi.Vec3(x, y, z_height), r=None)
             gymutil.draw_lines(line_geom, self.gym, self.viewer, self.envs[self.lookat_id], pose)
+
+    def _draw_push_arrow(self):
+        """Draw an arrow showing the push direction and magnitude."""
+        if not hasattr(self, 'push_velocity') or self.push_time_remaining[self.lookat_id] <= 0:
+            return  # No active push to visualize
+        
+        # Get push velocity for the lookat environment
+        push_vel = self.push_velocity[self.lookat_id].cpu().numpy()
+        push_magnitude = np.linalg.norm(push_vel)
+        
+        if push_magnitude < 0.01:  # Skip if push is too small
+            return
+        
+        # Get robot position
+        robot_pos = self.root_states[self.lookat_id, :3].cpu().numpy()
+        
+        # Normalize push direction
+        push_dir = push_vel / push_magnitude
+        
+        # Arrow length scales with push magnitude (max 2.0 m/s -> 0.5 m arrow)
+        max_push_vel = self.cfg.domain_rand.max_push_vel_xy
+        arrow_length = 0.5 * (push_magnitude / max_push_vel)  # Scale arrow length
+        
+        # Arrow start position (at robot base)
+        arrow_start = robot_pos[:2]
+        
+        # Arrow end position
+        arrow_end = arrow_start + push_dir * arrow_length
+        
+        # Arrow height (slightly above robot base)
+        arrow_z = robot_pos[2] + 0.1
+        
+        # Create arrow geometry (orange/yellow color to distinguish from other visualizations)
+        arrow_color = (1.0, 0.65, 0.0)  # Orange
+        arrow_geom = gymutil.WireframeSphereGeometry(0.05, 8, 8, None, color=arrow_color)
+        
+        # Draw arrow shaft (line from start to end)
+        num_segments = max(5, int(arrow_length * 10))  # More segments for longer arrows
+        for i in range(num_segments):
+            t = i / max(1, num_segments - 1)
+            x = arrow_start[0] + t * (arrow_end[0] - arrow_start[0])
+            y = arrow_start[1] + t * (arrow_end[1] - arrow_start[1])
+            pose = gymapi.Transform(gymapi.Vec3(x, y, arrow_z), r=None)
+            gymutil.draw_lines(arrow_geom, self.gym, self.viewer, self.envs[self.lookat_id], pose)
+        
+        # Draw arrowhead (triangle at the end)
+        arrowhead_size = 0.15
+        # Perpendicular direction for arrowhead
+        perp_dir = np.array([-push_dir[1], push_dir[0]])  # Rotate 90 degrees
+        
+        # Arrowhead points
+        arrowhead_tip = arrow_end
+        arrowhead_base1 = arrow_end - push_dir * arrowhead_size + perp_dir * arrowhead_size * 0.5
+        arrowhead_base2 = arrow_end - push_dir * arrowhead_size - perp_dir * arrowhead_size * 0.5
+        
+        # Draw arrowhead lines
+        for point in [arrowhead_base1, arrowhead_base2]:
+            for i in range(5):
+                t = i / 4.0
+                x = arrowhead_tip[0] + t * (point[0] - arrowhead_tip[0])
+                y = arrowhead_tip[1] + t * (point[1] - arrowhead_tip[1])
+                pose = gymapi.Transform(gymapi.Vec3(x, y, arrow_z), r=None)
+                gymutil.draw_lines(arrow_geom, self.gym, self.viewer, self.envs[self.lookat_id], pose)
 
     def compute_observations(self):
         """ 
