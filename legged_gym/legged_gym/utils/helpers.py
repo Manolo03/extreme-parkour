@@ -152,6 +152,12 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             env_cfg.terrain.num_rows = args.rows
         if args.cols is not None:
             env_cfg.terrain.num_cols = args.cols
+        if args.flat_terrain:
+            # Override terrain to use flat terrain
+            env_cfg.terrain.terrain_kwargs = {
+                "type": "flat_terrain",
+                "terrain_kwargs": {}
+            }
         if args.delay:
             env_cfg.domain_rand.action_delay = args.delay
         if not args.delay and not args.resume and not args.use_camera and args.headless: # if train from scratch
@@ -219,7 +225,8 @@ def get_args():
         {"name": "--hitid", "type": str, "default": None, "help": "exptid fot hitting policy"},
 
         {"name": "--web", "action": "store_true", "default": False, "help": "if use web viewer"},
-        {"name": "--no_wandb", "action": "store_true", "default": False, "help": "no wandb"}
+        {"name": "--no_wandb", "action": "store_true", "default": False, "help": "no wandb"},
+        {"name": "--flat_terrain", "action": "store_true", "default": False, "help": "Use flat terrain for all environments (no obstacles)"}
 
 
     ]

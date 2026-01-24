@@ -818,6 +818,30 @@ def demo_terrain(terrain):
     goals[-1] = [platform_length, left_y]
     terrain.goals = goals * terrain.horizontal_scale
 
+def flat_terrain(terrain):
+    """Create a completely flat terrain with no obstacles.
+    
+    Parameters:
+        terrain (SubTerrain): the terrain object to modify
+    Returns:
+        terrain (SubTerrain): updated terrain with goals set
+    """
+    # Initialize terrain to ground level (all zeros)
+    terrain.height_field_raw[:, :] = 0
+    
+    # Set goals at regular intervals along the terrain
+    num_goals = 8
+    goals = np.zeros((num_goals, 2))
+    mid_y = terrain.length // 2  # lateral center
+    for i in range(num_goals):
+        # Space goals evenly along the terrain
+        x_pos = (i + 1) * terrain.width / (num_goals + 1)
+        goals[i] = [x_pos, mid_y]
+    
+    terrain.goals = goals
+    terrain.idx = 0  # Use index 0 for flat terrain
+    return terrain
+
 def pit_terrain(terrain, depth, platform_size=1.):
     depth = int(depth / terrain.vertical_scale)
     platform_size = int(platform_size / terrain.horizontal_scale / 2)

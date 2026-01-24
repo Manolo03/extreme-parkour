@@ -71,7 +71,7 @@ def play(args):
     env_cfg.terrain.curriculum = False
     env_cfg.terrain.selected = True
     env_cfg.terrain.num_rows = 5
-    env_cfg.terrain.num_cols = 5
+    env_cfg.terrain.num_cols = 2
     
     # Ensure at least one environment per terrain tile
     min_num_envs = env_cfg.terrain.num_rows * env_cfg.terrain.num_cols  # 5 * 5 = 25
@@ -82,7 +82,7 @@ def play(args):
         # For visualization, use exactly min_num_envs to have one per tile
         env_cfg.env.num_envs = min_num_envs
     
-    env_cfg.env.episode_length_s = 60
+    env_cfg.env.episode_length_s = 20
     env_cfg.commands.resampling_time = 60
     env_cfg.terrain.terrain_length = 10.0  # matches training
     env_cfg.terrain.terrain_width = 30.0   # matches training
@@ -170,6 +170,14 @@ def play(args):
                         step_graphics=True,
                         render_all_camera_sensors=True,
                         wait_for_page_load=True)
+        
+        # Print commands for first 5 environments
+        num_to_print = min(5, env.num_envs)
+        if i % 50 == 0:  # Print every 50 steps to avoid spam
+            print(f"\nStep {i}: Commands for first {num_to_print} environments:")
+            for env_id in range(num_to_print):
+                cmd = env.commands[env_id].cpu().numpy()
+                print(f"  Env {env_id}: lin_vel_x={cmd[0]:.3f}, lin_vel_y={cmd[1]:.3f}, ang_vel_yaw={cmd[2]:.3f}, heading={cmd[3]:.3f}")
         
         id = env.lookat_id
         

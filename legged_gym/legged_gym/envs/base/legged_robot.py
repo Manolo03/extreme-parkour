@@ -399,13 +399,22 @@ class LeggedRobot(BaseTask):
             adds each terms to the episode sums and to the total reward
         """
         self.rew_buf[:] = 0.
+        # Optional clipping parameters (may not be defined for all configs)
+        clip_single = getattr(self.cfg.rewards, "clip_single_reward", None)
+        clip_total = getattr(self.cfg.rewards, "clip_reward", None)
         for i in range(len(self.reward_functions)):
             name = self.reward_names[i]
             rew = self.reward_functions[i]() * self.reward_scales[name]
+            # Per-term clipping if configured
+            if clip_single is not None:
+                rew = torch.clip(rew, -clip_single, clip_single)
             self.rew_buf += rew
             self.episode_sums[name] += rew
         if self.cfg.rewards.only_positive_rewards:
             self.rew_buf[:] = torch.clip(self.rew_buf[:], min=0.)
+        # Clip total reward if configured (before adding termination reward)
+        if clip_total is not None:
+            self.rew_buf[:] = torch.clip(self.rew_buf[:], -clip_total, clip_total)
         
         # add termination reward after clipping
         if "termination" in self.reward_scales:

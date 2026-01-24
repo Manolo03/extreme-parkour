@@ -285,39 +285,92 @@ class WfTron1aCfg(LeggedRobotCfg):
         collapse_fixed_joints = False
 
     class domain_rand(LeggedRobotCfg.domain_rand):
-        push_robots = True
+        push_robots = False
         push_interval_s = 5.0  # Push every 5 seconds (perpendicular to wall)
         max_push_vel_xy = 2.0  # Max push velocity in m/s
 
-    class rewards(LeggedRobotCfg.rewards):
-        soft_dof_pos_limit = 0.95
-        base_height_target = 0.6 + 0.1664
-        class scales:
-            # tracking rewards
-            tracking_goal_vel = 1.5
-            tracking_yaw = 0.5
-            # regularization rewards
-            lin_vel_z = -1.0
-            ang_vel_xy = -0.05
-            orientation = -1.
-            dof_acc = -2.5e-7
-            collision = -50.
-            action_rate = -0.1
-            delta_torques = -1.0e-7
-            torques = -0.00001
-            # termination penalty (only for base contact falls)
-            base_contact_termination = -50.0
-            #hip_pos = -0.5
-            #dof_error = -0.04
-            #feet_stumble = -1
-            #feet_edge = -1
+    # class rewards(LeggedRobotCfg.rewards):
+    #     soft_dof_pos_limit = 0.95
+    #     base_height_target = 0.6 + 0.1664
+    #     class scales:
+    #         # tracking rewards
+    #         tracking_goal_vel = 1.5
+    #         tracking_yaw = 0.5
+    #         # regularization rewards
+    #         lin_vel_z = -1.0
+    #         ang_vel_xy = -0.05
+    #         orientation = -1.
+    #         dof_acc = -2.5e-7
+    #         collision = -50.
+    #         action_rate = -0.1
+    #         delta_torques = -1.0e-7
+    #         torques = -0.00001
+    #         # termination penalty (only for base contact falls)
+    #         base_contact_termination = -50.0
+    #         #hip_pos = -0.5
+    #         #dof_error = -0.04
+    #         #feet_stumble = -1
+    #         #feet_edge = -1
             
-        only_positive_rewards = True # if true negative total rewards are clipped at zero (avoids early termination problems)
-        tracking_sigma = 0.2 # tracking reward = exp(-error^2/sigma)
-        soft_dof_vel_limit = 1
-        soft_torque_limit = 0.4
-        max_contact_force = 40. # forces above this value are penalized
+    #     only_positive_rewards = True # if true negative total rewards are clipped at zero (avoids early termination problems)
+    #     tracking_sigma = 0.2 # tracking reward = exp(-error^2/sigma)
+    #     soft_dof_vel_limit = 1
+    #     soft_torque_limit = 0.4
+    #     max_contact_force = 40. # forces above this value are penalized
 
+    class rewards:
+        class scales:
+            # termination related rewards
+            keep_balance = 1.0
+
+            # tracking related rewards
+            tracking_lin_vel = 4.0
+            tracking_yaw = 2.0
+            tracking_lin_vel_pb = 1.0
+            tracking_yaw_pb = 0.2
+
+            # regulation related rewards
+            #nominal_foot_position = 4.0
+            #leg_symmetry = 0.5
+            #same_foot_x_position = -50 # 0.5
+            #same_foot_z_position = -100
+            #lin_vel_z = -0.3
+            #ang_vel_xy = -0.3
+            torques = -0.00016
+            dof_acc = -1.5e-7
+            action_rate = -0.03
+            #dof_pos_limits = -2.0
+            collision = -50
+            action_smooth = -0.03
+            orientation = -12.0
+            #feet_distance = -100
+            base_height = -20
+
+        only_positive_rewards = False # if true negative total rewards are clipped at zero (avoids early termination problems)
+        clip_reward = 100
+        clip_single_reward = 5
+        tracking_sigma = 0.2  # tracking reward = exp(-error^2/sigma)
+        ang_tracking_sigma = 0.25  # tracking reward = exp(-error^2/sigma)
+        nominal_foot_position_tracking_sigma = 0.005
+        nominal_foot_position_tracking_sigma_wrt_v = 0.5
+        leg_symmetry_tracking_sigma = 0.001
+        foot_x_position_sigma = 0.001
+        height_tracking_sigma = 0.01
+        soft_dof_pos_limit = (
+            0.95  # percentage of urdf limits, values above this limit are penalized
+        )
+        soft_dof_vel_limit = 1.0
+        soft_torque_limit = 0.8
+        base_height_target = 0.6 + 0.1664
+        feet_height_target = 0.10
+        min_feet_distance = 0.32
+        max_feet_distance = 0.35
+        max_contact_force = 100.0  # forces above this value are penalized
+        kappa_gait_probs = 0.05
+        gait_force_sigma = 25.0
+        gait_vel_sigma = 0.25
+        gait_height_sigma = 0.005
+        feet_height_tracking_sigma = 0.005
 
 class WfTron1aCfgPPO(LeggedRobotCfgPPO):
     class algorithm(LeggedRobotCfgPPO.algorithm):

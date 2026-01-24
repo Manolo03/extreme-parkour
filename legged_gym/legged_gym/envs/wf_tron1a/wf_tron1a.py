@@ -218,6 +218,16 @@ class WfTron1a(LeggedRobot):
         self.force_sensor_tensor = torch.zeros(self.num_envs, n_feet, 6, device=self.device, dtype=torch.float)
         self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3) # shape: num_envs, num_bodies, xyz axis
 
+        # Base + feet state used by LIMX-style rewards
+        self.base_position = self.root_states[:, :3]
+        self.last_base_position = self.base_position.clone()
+        self.foot_positions = self.rigid_body_states[:, self.feet_indices, :3]
+        self.last_foot_positions = self.foot_positions.clone()
+
+        # Initialize previous tracking rewards for PB terms
+        self.rwd_linVelTrackPrev = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.rwd_angVelTrackPrev = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+
         # initialize some data used later on
         self.common_step_counter = 0
         self.extras = {}
@@ -415,6 +425,9 @@ class WfTron1a(LeggedRobot):
 
         # prepare quantities
         self.base_quat[:] = self.root_states[:, 3:7]
+        self.base_position = self.root_states[:, :3]
+        # Feet positions (world frame) used by multiple rewards (distance/symmetry/nominal foot position)
+        self.foot_positions = self.rigid_body_states[:, self.feet_indices, :3]
         self.base_lin_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.projected_gravity[:] = quat_rotate_inverse(self.base_quat, self.gravity_vec)
@@ -433,6 +446,9 @@ class WfTron1a(LeggedRobot):
         # compute observations, rewards, resets, ...
         self.check_termination()
         self.compute_reward()
+        # Update previous tracking rewards for PB terms (AFTER computing rewards, for next step)
+        self.rwd_linVelTrackPrev = self._reward_tracking_lin_vel()
+        self.rwd_angVelTrackPrev = self._reward_tracking_yaw()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)
 
@@ -447,6 +463,8 @@ class WfTron1a(LeggedRobot):
         self.last_dof_vel[:] = self.dof_vel[:]
         self.last_torques[:] = self.torques[:]
         self.last_root_vel[:] = self.root_states[:, 7:13]
+        self.last_base_position[:] = self.base_position[:]
+        self.last_foot_positions[:] = self.foot_positions[:]
         
         # Update push visualization timer (fade out over time)
         self.push_time_remaining[:] = torch.clamp(self.push_time_remaining - self.dt, min=0.0)
@@ -865,7 +883,8 @@ class WfTron1a(LeggedRobot):
         """Tron1a-specific command resampling.
         
         - Sample only forward velocity (lin_vel_x) from command_ranges
-        - Zero out lateral velocity, yaw rate, and heading commands
+        - Zero out lateral velocity and yaw rate commands (indices 1 and 2)
+        - Set heading command (index 3) to heading_target value
         - Keep heading_target fixed per environment (restore from initial)
         - No heading_command logic from base class
         """
@@ -880,110 +899,222 @@ class WfTron1a(LeggedRobot):
             device=self.device,
         ).squeeze(1)
         
-        # Zero out lateral velocity
-        self.commands[env_ids, 1:] = 0.0
+        # Zero out lateral velocity and yaw rate (indices 1 and 2)
+        self.commands[env_ids, 1] = 0.0
+        self.commands[env_ids, 2] = 0.0
         
         # Set small commands to zero (same clipping logic as base class)
         self.commands[env_ids, :2] *= torch.abs(self.commands[env_ids, 0:1]) > self.cfg.commands.lin_vel_clip
         
         # Restore the original heading_target for these environments
         self.heading_target[env_ids] = self.heading_target_initial[env_ids]
+        
+        # Set heading command (index 3) to heading_target value
+        self.commands[env_ids, 3] = self.heading_target[env_ids]
     
     ################## parkour rewards ##################
 
-    def _reward_tracking_goal_vel(self):
-        # Reward velocity component in the direction of heading_target (not terrain goal direction)
-        # heading_target is the desired heading angle, convert to unit direction vector
-        heading_dir = torch.stack([torch.cos(self.heading_target), torch.sin(self.heading_target)], dim=1)  # (num_envs, 2)
-        cur_vel_xy = self.root_states[:, 7:9]  # world frame linear velocity (x, y)
-        # Project velocity onto heading direction: dot(vel, heading_dir)
-        vel_component = torch.sum(heading_dir * cur_vel_xy, dim=-1)  # (num_envs,)
-        # Normalize by command velocity and cap at 1.0 (same as original)
-        rew = torch.minimum(vel_component, self.commands[:, 0]) / (self.commands[:, 0] + 1e-5)
-        return rew
+    # def _reward_tracking_goal_vel(self):
+    #     # Reward velocity component in the direction of heading_target (not terrain goal direction)
+    #     # heading_target is the desired heading angle, convert to unit direction vector
+    #     heading_dir = torch.stack([torch.cos(self.heading_target), torch.sin(self.heading_target)], dim=1)  # (num_envs, 2)
+    #     cur_vel_xy = self.root_states[:, 7:9]  # world frame linear velocity (x, y)
+    #     # Project velocity onto heading direction: dot(vel, heading_dir)
+    #     vel_component = torch.sum(heading_dir * cur_vel_xy, dim=-1)  # (num_envs,)
+    #     # Normalize by command velocity and cap at 1.0 (same as original)
+    #     rew = torch.minimum(vel_component, self.commands[:, 0]) / (self.commands[:, 0] + 1e-5)
+    #     return rew
 
-    def _reward_tracking_yaw(self):
-        # Track the per-env fixed heading target instead of terrain-goal yaw.
-        rew = torch.exp(-torch.abs(wrap_to_pi(self.heading_target - self.yaw)))
-        return rew
+    # def _reward_tracking_yaw(self):
+    #     # Track the per-env fixed heading target instead of terrain-goal yaw.
+    #     rew = torch.exp(-torch.abs(wrap_to_pi(self.heading_target - self.yaw)))
+    #     return rew
     
-    def _reward_lin_vel_z(self):
-        rew = torch.square(self.base_lin_vel[:, 2])
-        return rew
+    # def _reward_lin_vel_z(self):
+    #     rew = torch.square(self.base_lin_vel[:, 2])
+    #     return rew
     
-    def _reward_ang_vel_xy(self):
-        return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
+    # def _reward_ang_vel_xy(self):
+    #     return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
      
-    def _reward_orientation(self):
-        rew = torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
-        return rew
+    # def _reward_orientation(self):
+    #     rew = torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
+    #     return rew
 
-    def _reward_dof_acc(self):
-        return torch.sum(torch.square((self.last_dof_vel - self.dof_vel) / self.dt), dim=1)
+    # def _reward_dof_acc(self):
+    #     return torch.sum(torch.square((self.last_dof_vel - self.dof_vel) / self.dt), dim=1)
+
+    # def _reward_collision(self):
+    #     return torch.sum(1.*(torch.norm(self.contact_forces[:, self.penalised_contact_indices, :], dim=-1) > 0.1), dim=1)
+
+    # def _reward_action_rate(self):
+    #     return torch.norm(self.last_actions - self.actions, dim=1)
+
+    # def _reward_delta_torques(self):
+    #     return torch.sum(torch.square(self.torques - self.last_torques), dim=1)
+    
+    # def _reward_torques(self):
+    #     return torch.sum(torch.square(self.torques), dim=1)
+    
+    # def _reward_base_contact_termination(self):
+    #     """Penalty for falling (base link contact with ground).
+    #     Returns 1.0 when base contact causes termination, 0.0 otherwise.
+    #     Should be multiplied by a large negative scale (e.g., -100.0).
+    #     """
+    #     return self.base_contact_termination.float()
+
+    # def _reward_hip_pos(self):
+    #     return torch.sum(torch.square(self.dof_pos[:, self.hip_indices] - self.default_dof_pos[:, self.hip_indices]), dim=1)
+
+    # def _reward_dof_error(self):
+    #     """Penalize DOF positions deviating from default, excluding wheel joints."""
+    #     # Use helper function to get non-wheel DOF mask
+    #     non_wheel_mask = self._get_non_wheel_dof_mask()
+        
+    #     # Only penalize non-wheel DOFs
+    #     leg_dof_pos = self.dof_pos[:, non_wheel_mask]
+    #     leg_default_dof_pos = self.default_dof_pos[:, non_wheel_mask]
+    #     dof_error = torch.sum(torch.square(leg_dof_pos - leg_default_dof_pos), dim=1)
+    #     return dof_error
+    
+    def _reward_feet_distance(self):
+        # Penalize base height away from target
+        feet_distance = torch.norm(
+            self.foot_positions[:, 0, :2] - self.foot_positions[:, 1, :2], dim=-1
+        )
+        reward = torch.clip(self.cfg.rewards.min_feet_distance - feet_distance, 0, 1) + \
+                 torch.clip(feet_distance - self.cfg.rewards.max_feet_distance, 0, 1)
+        return reward
 
     def _reward_collision(self):
-        return torch.sum(1.*(torch.norm(self.contact_forces[:, self.penalised_contact_indices, :], dim=-1) > 0.1), dim=1)
+        return torch.sum(
+            torch.norm(
+                self.contact_forces[:, self.penalised_contact_indices, :], dim=-1) > 1.0, dim=1)
+
+    def _reward_nominal_foot_position(self):
+        #1. calculate foot postion wrt base in base frame  
+        nominal_base_height = -(self.cfg.rewards.base_height_target- self.cfg.asset.foot_radius)
+        foot_positions_base = self.foot_positions - \
+                            (self.base_position).unsqueeze(1).repeat(1, len(self.feet_indices), 1)
+        reward = 0
+        for i in range(len(self.feet_indices)):
+            foot_positions_base[:, i, :] = quat_rotate_inverse(self.base_quat, foot_positions_base[:, i, :] )
+            height_error = nominal_base_height - foot_positions_base[:, i, 2]
+            reward += torch.exp(-(height_error ** 2)/ self.cfg.rewards.nominal_foot_position_tracking_sigma)
+        # Only use command 0 (lin_vel_x) since commands 1 and 2 are not used
+        vel_cmd_norm = torch.abs(self.commands[:, 0])
+        return reward / len(self.feet_indices)*torch.exp(-(vel_cmd_norm ** 2)/self.cfg.rewards.nominal_foot_position_tracking_sigma_wrt_v)
+    
+    def _reward_same_foot_z_position(self):
+        reward = 0
+        foot_positions_base = self.foot_positions - \
+                            (self.base_position).unsqueeze(1).repeat(1, len(self.feet_indices), 1)
+        for i in range(len(self.feet_indices)):
+            foot_positions_base[:, i, :] = quat_rotate_inverse(self.base_quat, foot_positions_base[:, i, :] )
+        foot_z_position_err = foot_positions_base[:,0,2] - foot_positions_base[:,1,2]
+        return foot_z_position_err ** 2
+
+    def _reward_leg_symmetry(self):
+        foot_positions_base = self.foot_positions - \
+                            (self.base_position).unsqueeze(1).repeat(1, len(self.feet_indices), 1)
+        for i in range(len(self.feet_indices)):
+            foot_positions_base[:, i, :] = quat_rotate_inverse(self.base_quat, foot_positions_base[:, i, :] )
+        leg_symmetry_err = (abs(foot_positions_base[:,0,1])-abs(foot_positions_base[:,1,1]))
+        return torch.exp(-(leg_symmetry_err ** 2)/ self.cfg.rewards.leg_symmetry_tracking_sigma)
+
+    def _reward_same_foot_x_position(self):
+        reward = 0
+        foot_positions_base = self.foot_positions - \
+                            (self.base_position).unsqueeze(1).repeat(1, len(self.feet_indices), 1)
+        for i in range(len(self.feet_indices)):
+            foot_positions_base[:, i, :] = quat_rotate_inverse(self.base_quat, foot_positions_base[:, i, :] )
+        foot_x_position_err = foot_positions_base[:,0,0] - foot_positions_base[:,1,0]
+        # reward = torch.exp(-(foot_x_position_err ** 2)/ self.cfg.rewards.foot_x_position_sigma)
+        reward = torch.abs(foot_x_position_err)
+        return reward
+
+    def _reward_lin_vel_z(self):
+        # Penalize z axis base linear velocity
+        return torch.square(self.base_lin_vel[:, 2])
+
+    def _reward_ang_vel_xy(self):
+        # Penalize xy axes base angular velocity
+        return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
+
+    def _reward_orientation(self):
+        # Penalize non flat base orientation
+        reward = torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
+        return reward
+
+    def _reward_torques(self):
+        # Penalize torques
+        return torch.sum(torch.square(self.torques), dim=1)
+
+    def _reward_dof_acc(self):
+        """Penalize DOF accelerations using finite differences on DOF velocities.
+
+        Matches the base implementation: (last_dof_vel - dof_vel) / dt.
+        """
+        dof_acc = (self.last_dof_vel - self.dof_vel) / self.dt
+        return torch.sum(torch.square(dof_acc), dim=1)
 
     def _reward_action_rate(self):
-        return torch.norm(self.last_actions - self.actions, dim=1)
+        """Penalize changes in actions using the action history buffer.
 
-    def _reward_delta_torques(self):
-        return torch.sum(torch.square(self.torques - self.last_torques), dim=1)
-    
-    def _reward_torques(self):
-        return torch.sum(torch.square(self.torques), dim=1)
-    
-    def _reward_base_contact_termination(self):
-        """Penalty for falling (base link contact with ground).
-        Returns 1.0 when base contact causes termination, 0.0 otherwise.
-        Should be multiplied by a large negative scale (e.g., -100.0).
+        Uses the previous action from `action_history_buf` (second-to-last entry)
+        to compute a finite-difference action rate term.
         """
-        return self.base_contact_termination.float()
+        # Previous action applied (shape: [num_envs, num_actions])
+        prev_actions = self.action_history_buf[:, -2]
+        return torch.sum(torch.square(self.actions - prev_actions), dim=1)
 
-    def _reward_hip_pos(self):
-        return torch.sum(torch.square(self.dof_pos[:, self.hip_indices] - self.default_dof_pos[:, self.hip_indices]), dim=1)
+    def _reward_action_smooth(self):
+        """Penalize non-smooth actions using a second-order finite difference.
 
-    def _reward_dof_error(self):
-        """Penalize DOF positions deviating from default, excluding wheel joints."""
-        # Use helper function to get non-wheel DOF mask
-        non_wheel_mask = self._get_non_wheel_dof_mask()
-        
-        # Only penalize non-wheel DOFs
-        leg_dof_pos = self.dof_pos[:, non_wheel_mask]
-        leg_default_dof_pos = self.default_dof_pos[:, non_wheel_mask]
-        dof_error = torch.sum(torch.square(leg_dof_pos - leg_default_dof_pos), dim=1)
-        return dof_error
+        Approximates the second derivative of the action signal using the last
+        three entries in `action_history_buf`.
+        """
+        # Last three actions from history: a_{t-2}, a_{t-1}, a_t (current)
+        a_t   = self.actions
+        a_tm1 = self.action_history_buf[:, -2]
+        a_tm2 = self.action_history_buf[:, -3]
+        smooth_term = a_t - 2 * a_tm1 + a_tm2
+        return torch.sum(torch.square(smooth_term), dim=1)
+
+    def _reward_keep_balance(self):
+        return torch.ones(
+            self.num_envs, dtype=torch.float, device=self.device, requires_grad=False
+        )
+
+    def _reward_dof_pos_limits(self):
+        # Penalize dof positions too close to the limit
+        out_of_limits = -(self.dof_pos - self.dof_pos_limits[:, 0]).clip(max=0.0)  # lower limit
+        out_of_limits += (self.dof_pos - self.dof_pos_limits[:, 1]).clip(min=0.0)
+        return torch.sum(out_of_limits, dim=1)
+
+    def _reward_tracking_lin_vel(self):
+        # Tracking of linear velocity command (x-axis only, command index 0)
+        lin_vel_error = torch.square(self.commands[:, 0] - self.base_lin_vel[:, 0])
+        return torch.exp(-lin_vel_error / self.cfg.rewards.tracking_sigma)
+
+    def _reward_tracking_lin_vel_pb(self):
+        delta_phi = ~self.reset_buf * (self._reward_tracking_lin_vel() - self.rwd_linVelTrackPrev)
+        # return ang_vel_error
+        return delta_phi / self.dt
+
+    def _reward_tracking_yaw(self):
+        # Tracking of heading command (command index 3)
+        # Compute heading error: desired heading (command 3) - current yaw
+        heading_error = wrap_to_pi(self.commands[:, 3] - self.yaw)
+        ang_vel_error = torch.square(heading_error)
+        return torch.exp(-ang_vel_error / self.cfg.rewards.ang_tracking_sigma)
+
+    def _reward_tracking_yaw_pb(self):
+        delta_phi = ~self.reset_buf * (self._reward_tracking_yaw() - self.rwd_angVelTrackPrev)
+        # return ang_vel_error
+        return delta_phi / self.dt
     
-    def _reward_feet_stumble(self):
-        # Penalize feet hitting vertical surfaces
-        rew = torch.any(torch.norm(self.contact_forces[:, self.feet_indices, :2], dim=2) >\
-             4 *torch.abs(self.contact_forces[:, self.feet_indices, 2]), dim=1)
-        return rew.float()
-
-    def _reward_feet_edge(self):
-        """Penalize wheels/feet at terrain edges, checking forward direction with radius offset."""
-        # Skip if terrain doesn't exist or required attributes are missing (e.g., plane terrain)
-        if not hasattr(self, 'terrain') or self.terrain is None or \
-           not hasattr(self, 'x_edge_mask') or not hasattr(self, 'terrain_levels'):
-            if not hasattr(self, 'feet_at_edge'):
-                self.feet_at_edge = torch.zeros(self.num_envs, self.feet_indices.shape[0], dtype=torch.bool, device=self.device)
-            return torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
-        
-        # Get forward direction from robot heading
-        forward_vec = torch.stack([torch.cos(self.yaw), torch.sin(self.yaw)], dim=1)  # (num_envs, 2)
-        
-        # Offset wheel center forward by radius to check forward edge
-        foot_radius_pixels = self.cfg.asset.foot_radius / self.cfg.terrain.horizontal_scale
-        feet_pos_xy = ((self.rigid_body_states[:, self.feet_indices, :2] + self.terrain.cfg.border_size) / self.cfg.terrain.horizontal_scale)  # (num_envs, n_feet, 2)
-        # Offset forward by wheel radius
-        forward_offset = forward_vec.unsqueeze(1) * foot_radius_pixels  # (num_envs, 1, 2)
-        check_pos_xy = feet_pos_xy + forward_offset  # (num_envs, n_feet, 2)
-        
-        check_pos_xy = check_pos_xy.round().long()
-        check_pos_xy[..., 0] = torch.clip(check_pos_xy[..., 0], 0, self.x_edge_mask.shape[0]-1)
-        check_pos_xy[..., 1] = torch.clip(check_pos_xy[..., 1], 0, self.x_edge_mask.shape[1]-1)
-        feet_at_edge = self.x_edge_mask[check_pos_xy[..., 0], check_pos_xy[..., 1]]
-    
-        self.feet_at_edge = self.contact_filt & feet_at_edge
-        rew = (self.terrain_levels > 3) * torch.sum(self.feet_at_edge, dim=-1)
-        return rew
+    def _reward_base_height(self):
+        # Penalize base height away from target
+        base_height = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1)
+        return torch.abs(base_height - self.cfg.rewards.base_height_target)
