@@ -334,11 +334,11 @@ class WfTron1aCfg(LeggedRobotCfg):
             #leg_symmetry = 0.5
             #same_foot_x_position = -50 # 0.5
             #same_foot_z_position = -100
-            #lin_vel_z = -0.3
-            #ang_vel_xy = -0.3
-            torques = -0.00016
-            dof_acc = -1.5e-7
-            action_rate = -0.03
+            # lin_vel_z = -0.3
+            # ang_vel_xy = -0.3
+            torques = -0.0016
+            dof_acc = -1.5e-6
+            action_rate = -0.05
             #dof_pos_limits = -2.0
             collision = -50
             action_smooth = -0.03
