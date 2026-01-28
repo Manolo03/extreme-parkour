@@ -70,13 +70,13 @@ class WfTron1aCfg(LeggedRobotCfg):
     class init_state(LeggedRobotCfg.init_state):
         pos = [0.0, 0.0, 0.8 + 0.1664]  # x,y,z [m]
         default_joint_angles = {  # target angles when action = 0.0
-            "abad_L_Joint": 0.0,
-            "hip_L_Joint": 0.0,
-            "knee_L_Joint": 0.0,
+            "abad_L_Joint": 0.0150,
+            "hip_L_Joint": 0.250,
+            "knee_L_Joint": 0.750,
             "wheel_L_Joint": 0.0,
-            "abad_R_Joint": 0.0,
-            "hip_R_Joint": 0.0,
-            "knee_R_Joint": 0.0,
+            "abad_R_Joint": -0.0150,
+            "hip_R_Joint": -0.250,
+            "knee_R_Joint": -0.750,
             "wheel_R_Joint": 0.0,
         }
 
@@ -326,25 +326,25 @@ class WfTron1aCfg(LeggedRobotCfg):
             # tracking related rewards
             tracking_lin_vel = 4.0
             tracking_yaw = 2.0
-            tracking_lin_vel_pb = 1.0
-            tracking_yaw_pb = 0.2
+            #tracking_lin_vel_pb = 1.0
+            #tracking_yaw_pb = 0.2
 
             # regulation related rewards
             #nominal_foot_position = 4.0
             #leg_symmetry = 0.5
             #same_foot_x_position = -50 # 0.5
             #same_foot_z_position = -100
-            # lin_vel_z = -0.3
-            # ang_vel_xy = -0.3
-            torques = -0.0016
-            dof_acc = -1.5e-6
-            action_rate = -0.05
+            lin_vel_z = -0.3
+            ang_vel_xy = -0.3
+            torques = -0.00016
+            dof_acc = -1.5e-7
+            action_rate = -0.03
             #dof_pos_limits = -2.0
             collision = -50
-            action_smooth = -0.03
+            # action_smooth = -0.03
             orientation = -12.0
             #feet_distance = -100
-            base_height = -20
+            #base_height = -20
 
         only_positive_rewards = False # if true negative total rewards are clipped at zero (avoids early termination problems)
         clip_reward = 100
