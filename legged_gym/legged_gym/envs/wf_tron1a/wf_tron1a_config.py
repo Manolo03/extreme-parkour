@@ -285,7 +285,7 @@ class WfTron1aCfg(LeggedRobotCfg):
         collapse_fixed_joints = False
 
     class domain_rand(LeggedRobotCfg.domain_rand):
-        push_robots = False
+        push_robots = True
         push_interval_s = 5.0  # Push every 5 seconds (perpendicular to wall)
         max_push_vel_xy = 2.0  # Max push velocity in m/s
 
@@ -336,9 +336,9 @@ class WfTron1aCfg(LeggedRobotCfg):
             #same_foot_z_position = -100
             lin_vel_z = -0.3
             ang_vel_xy = -0.3
-            torques = -0.00016
+            torques = -0.0005
             dof_acc = -1.5e-7
-            action_rate = -0.03
+            action_rate = -0.05
             #dof_pos_limits = -2.0
             collision = -50
             # action_smooth = -0.03
