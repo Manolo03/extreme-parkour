@@ -336,9 +336,9 @@ class WfTron1aCfg(LeggedRobotCfg):
             #same_foot_z_position = -100
             lin_vel_z = -0.3
             ang_vel_xy = -0.3
-            torques = -0.0005
+            torques = -0.0007
             dof_acc = -1.5e-7
-            action_rate = -0.05
+            action_rate = -0.07
             #dof_pos_limits = -2.0
             collision = -50
             # action_smooth = -0.03
